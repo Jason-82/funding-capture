@@ -1,0 +1,81 @@
+# Copy to config.yaml (git-ignored) and edit. Every key below is optional; omitted keys
+# use the defaults in the code. Unknown keys are rejected so typos don't pass silently.
+#
+# API keys never go in this file. Live mode reads them from the environment:
+#   <VENUE>_API_KEY, <VENUE>_SECRET, <VENUE>_PASSWORD (okx), and for hyperliquid
+#   HYPERLIQUID_WALLET_ADDRESS / HYPERLIQUID_PRIVATE_KEY (use an API/agent wallet).
+# Use dedicated sub-accounts: the bot assumes it owns every position on the
+# instruments it trades.
+
+mode: paper            # paper | live (live also needs the CLI confirmation flag)
+data_dir: data         # where `fcap fetch` stores funding history
+
+# Venues to scan/trade. Only list venues you can legally use from your jurisdiction.
+venues:
+  binance: {}
+  bybit: {}
+  okx: {}
+  hyperliquid:
+    quotes: [USDC]
+
+# Fee overrides as fractions (0.0005 = 5 bps). Defaults are base-tier public schedules;
+# put your real tier here, it changes which trades are worth taking.
+fees:
+  binance: {spot_taker: 0.00075, perp_taker: 0.00045}
+
+costs:
+  slippage_bps: 3            # per fill on top of fees
+  taker: true                # false if you work passive orders (not implemented yet)
+  perp_leverage: 2           # notional / margin on each perp leg
+  unified_margin_credit: 0.0 # 0..1, same-venue spot collateral credited to the short perp
+  borrow_apr: 0.10           # assumed borrow cost for short-spot legs (reverse carry)
+
+strategy:
+  constructions: [spot_perp, perp_perp]   # add reverse_spot_perp only with borrow_venues
+  cross_venue_spot: true
+  borrow_venues: []
+  horizon_hours: 168         # entries are judged on expected carry over this hold
+  entry_apr: 0.15            # min forecast net APR on capital after round-trip costs
+  exit_apr: 0.0              # exit when forecast carry APR on capital drops below this
+  max_breakeven_hours: 72
+  max_hold_hours: null
+  forecast:
+    halflife_hours: 24       # smoothing of observed funding
+    reversion_halflife_hours: 72
+    anchor_apr: 0.1095       # what funding reverts to (0.01%/8h baseline)
+    anchor_halflife_hours: null   # set e.g. 720 to revert to each market's own 30d level
+    live_weight: 0.5         # weight on the live predicted rate in the engine
+
+portfolio:
+  capital_usd: 10000
+  max_positions: 5
+  max_positions_per_asset: 1
+  max_position_usd: 2000     # notional per pair
+  min_position_usd: 100
+  min_volume_usd: 5000000    # 24h volume required on both legs
+  max_spread_bps: 15
+  settlement_guard_minutes: 10
+  risk_cooldown_minutes: 240
+  state_dir: state
+  loop_seconds: 60
+
+risk:
+  max_delta_drift: 0.02
+  close_delta_drift: 0.10
+  warn_liq_distance: 0.35
+  min_liq_distance: 0.20
+  warn_leg_divergence: 0.01
+  max_leg_divergence: 0.03
+  max_loss_frac: 0.03
+  max_data_age_s: 180
+
+execution:
+  max_slice_usd: 1000
+  touch_fraction: 0.5
+  entry_slippage_bps: 10
+  hedge_slippage_bps: 25
+  hedge_retries: 4
+
+backtest:
+  warmup_hours: 72
+  max_leg_abs_apr: 5.0       # skip legs printing >500% APR (untradeable squeezes)
