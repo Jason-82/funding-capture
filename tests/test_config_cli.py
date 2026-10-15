@@ -80,3 +80,29 @@ def test_env_file_loader(tmp_path, monkeypatch):
     assert os.environ["KRAKEN_SECRET"] == "s3cr=t"
     assert os.environ["EXISTING"] == "old"  # never overrides the real environment
     assert load_env_file(str(tmp_path / "missing")) == 0
+
+
+def test_status_reads_paper_state_separately_from_live(tmp_path, capsys):
+    from funding_capture.models import Candidate, PairPosition
+    from funding_capture.state import position_to_dict, save_json
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
+    pos = PairPosition(
+        "P1",
+        Candidate(Construction.SPOT_PERP, "BTC", spot("k"), perp("h")),
+        0.1,
+        100.0,
+        100.0,
+        T0,
+        funding_usd=1.5,
+    )
+    save_json(
+        tmp_path / "state" / "paper" / "engine.json",
+        {"positions": [position_to_dict(pos)], "closed": []},
+    )
+    main(["-c", str(cfg), "status"])
+    out = capsys.readouterr().out
+    assert "open pairs: 1" in out and "P1" in out and "funding=$1.50" in out
+    with pytest.raises(SystemExit, match="fcap live"):
+        main(["-c", str(cfg), "status", "--live"])

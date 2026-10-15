@@ -253,7 +253,7 @@ class Engine:
         if (d / "FLATTEN").exists():
             self.entries_halted = "FLATTEN file present"
             for pos in list(self.positions.values()):
-                self._close(pos, "kill switch: FLATTEN", rep, now)
+                self._close(pos, "kill switch: FLATTEN", rep, now, urgent=True)
         elif (d / "STOP").exists():
             self.entries_halted = "STOP file present"
         elif self.entries_halted and self.entries_halted.endswith("file present"):
@@ -309,7 +309,7 @@ class Engine:
                 if any(a.check == "delta" for a in closes):
                     self._flatten(pos, why, rep, now)  # a leg is gone: can't pair-trade it
                 else:
-                    self._close(pos, why, rep, now)
+                    self._close(pos, why, rep, now, urgent=True)
             elif action is Action.REBALANCE:
                 self._rebalance(pos)
 
@@ -352,10 +352,12 @@ class Engine:
                 continue  # collect the settlement that is about to pay us, then leave
             self._close(pos, reason, rep, now)
 
-    def _close(self, pos: PairPosition, reason: str, rep: StepReport, now: int) -> None:
+    def _close(
+        self, pos: PairPosition, reason: str, rep: StepReport, now: int, urgent: bool = False
+    ) -> None:
         c = pos.candidate
         try:
-            ex = self.executor.close(c, pos.qty)
+            ex = self.executor.close(c, pos.qty, urgent=urgent)
         except Exception as exc:
             log.error("close %s failed: %s", pos.id, exc)
             pos.notes.append(f"close failed: {exc}")

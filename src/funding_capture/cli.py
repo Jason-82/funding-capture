@@ -139,10 +139,10 @@ def cmd_status(args, settings: Settings) -> None:
 
     from .state import load_json, position_from_dict
 
-    path = Path(settings.portfolio.state_dir) / "engine.json"
+    path = Path(_state_dir(settings, args.live)) / "engine.json"
     data = load_json(path)
     if not data:
-        sys.exit(f"no state at {path}; has `fcap paper` or `fcap live` run yet?")
+        sys.exit(f"no state at {path}; has `fcap {'live' if args.live else 'paper'}` run yet?")
     open_ = [position_from_dict(d) for d in data.get("positions", [])]
     closed = [position_from_dict(d) for d in data.get("closed", [])]
     print(f"state: {path}")
@@ -252,7 +252,16 @@ def cmd_sweep(args, settings: Settings) -> None:
     print("\nChoose by test_apr_pct stability, not by the best train row.")
 
 
+def _state_dir(settings: Settings, live: bool) -> str:
+    """Paper and live keep separate state so paper positions are never mistaken for real."""
+    from pathlib import Path
+
+    return str(Path(settings.portfolio.state_dir) / ("live" if live else "paper"))
+
+
 def _engine(settings: Settings, live: bool):
+    import dataclasses
+
     from .data import HistoryStore
     from .engine import Engine
     from .execution import PairExecutor
@@ -274,7 +283,7 @@ def _engine(settings: Settings, live: bool):
         settings.costs,
         executor,
         settings.risk,
-        settings.portfolio,
+        dataclasses.replace(settings.portfolio, state_dir=_state_dir(settings, live)),
         store=HistoryStore(settings.data_dir),
     )
 
@@ -305,6 +314,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("status", help="show positions and P&L from the engine state file")
     s.add_argument("--last", type=int, default=20, help="closed pairs to list")
+    s.add_argument("--live", action="store_true", help="show the live engine (default: paper)")
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("scan", help="rank live opportunities across venues")

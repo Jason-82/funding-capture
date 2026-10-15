@@ -281,6 +281,10 @@ class CcxtVenue(Venue):
             order = self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params)
         except ccxt.OrderImmediatelyFillable:
             return None
+        except ccxt.InvalidOrder as exc:  # venues word "would cross" rejections differently
+            if "post" in str(exc).lower():
+                return None
+            raise
         if order.get("status") in ("canceled", "cancelled", "rejected", "expired"):
             return None  # some venues accept then cancel a post-only that would cross
         return str(order["id"])
