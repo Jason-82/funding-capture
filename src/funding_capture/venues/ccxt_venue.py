@@ -57,6 +57,22 @@ def credentials_from_env(venue: str) -> dict[str, str]:
     return out
 
 
+# Options we always want for some ccxt exchanges (user options override these).
+_DEFAULT_OPTIONS: dict[str, dict] = {
+    # ccxt otherwise approves and attaches its own builder fee: +0.01% per fill.
+    "hyperliquid": {"builderFee": False, "fetchMarkets": {"types": ["spot", "swap"]}},
+    # ccxt otherwise attaches a 0.10% integrator fee per fill on non-standard accounts.
+    "lighter": {"builderFee": False},
+}
+
+# Venues whose ccxt funding rate is quoted per N hours although they settle hourly.
+# Lighter's /funding-rates normalises every venue to an 8h-equivalent fraction.
+_RATE_QUOTED_PER_HOURS: dict[str, float] = {"lighter": 8.0}
+
+# Up to this many instruments without a usable ticker bid/ask get an order-book quote.
+_BOOK_FALLBACK_MAX = 20
+
+
 class CcxtVenue(Venue):
     def __init__(
         self,
@@ -76,9 +92,10 @@ class CcxtVenue(Venue):
         if exchange is None:
             import ccxt
 
-            klass = getattr(ccxt, ccxt_id or name)
-            exchange = klass(
-                {"enableRateLimit": True, **(credentials or {}), "options": options or {}}
+            ex_id = ccxt_id or name
+            merged = {**_DEFAULT_OPTIONS.get(ex_id, {}), **(options or {})}
+            exchange = getattr(ccxt, ex_id)(
+                {"enableRateLimit": True, **(credentials or {}), "options": merged}
             )
         self.ex = exchange
         self._by_symbol: dict[str, Instrument] = {}
@@ -102,7 +119,10 @@ class CcxtVenue(Venue):
                 continue
             if kind not in self.kinds:
                 continue
-            asset, mult = canonical_asset(m["base"], self.aliases)
+            base, raw = m["base"], m.get("baseName")
+            if raw and raw[:1] == "k" and raw[1:].upper() == base[1:]:
+                base = raw  # Hyperliquid's kPEPE (1000 PEPE) arrives as base "KPEPE"
+            asset, mult = canonical_asset(base, self.aliases)
             inst = Instrument(self.name, sym, asset, kind, quote, mult, contract_size)
             if kind is Kind.PERP:
                 self._by_symbol[sym] = inst
@@ -153,15 +173,23 @@ class CcxtVenue(Venue):
             interval = (
                 parse_interval_hours(fr.get("interval"))
                 or self._intervals.get(sym)
-                or DEFAULT_INTERVAL_HOURS.get(self.name, 8.0)
+                or DEFAULT_INTERVAL_HOURS.get(
+                    self.ex.id, DEFAULT_INTERVAL_HOURS.get(self.name, 8.0)
+                )
             )
+            rate = float(rate)
+            next_ts = fr.get("fundingTimestamp") or fr.get("nextFundingTimestamp")
+            quoted_per = _RATE_QUOTED_PER_HOURS.get(self.ex.id)
+            if quoted_per:  # convert to the hourly rate actually settled each hour
+                rate, interval = rate * interval / quoted_per, interval
+                next_ts = next_ts or (now // 3_600_000 + 1) * 3_600_000
             mark, index = fr.get("markPrice"), fr.get("indexPrice")
             out[inst.key] = FundingSnapshot(
                 instrument=inst,
-                rate=float(rate),
+                rate=rate,
                 interval_hours=interval,
                 ts=int(fr.get("timestamp") or now),
-                next_funding_ts=fr.get("fundingTimestamp") or fr.get("nextFundingTimestamp"),
+                next_funding_ts=next_ts,
                 mark_price=float(mark) / inst.multiplier if mark else None,
                 index_price=float(index) / inst.multiplier if index else None,
             )
@@ -175,9 +203,13 @@ class CcxtVenue(Venue):
             if not group:
                 continue
             tickers = self.ex.fetch_tickers(list(group))
+            missing = []  # e.g. Hyperliquid spot tickers carry no bid/ask at all
             for sym, t in tickers.items():
                 inst = group.get(sym)
-                if inst is None or not t.get("bid") or not t.get("ask"):
+                if inst is None:
+                    continue
+                if not t.get("bid") or not t.get("ask"):
+                    missing.append((inst, t))
                     continue
                 unit = inst.multiplier * (inst.contract_size if kind is Kind.PERP else 1.0)
                 vol = t.get("quoteVolume")
@@ -192,6 +224,29 @@ class CcxtVenue(Venue):
                     ts=int(t.get("timestamp") or time.time() * 1000),
                     volume_usd_24h=float(vol) if vol else None,
                 )
+            out.update(self._book_quotes(missing))
+        return out
+
+    def _book_quotes(self, missing: list[tuple[Instrument, dict]]) -> dict[str, Quote]:
+        """Order-book quotes for the most traded instruments whose ticker lacked bid/ask."""
+
+        def volume(t: dict) -> float:
+            if t.get("quoteVolume"):
+                return float(t["quoteVolume"])
+            return float(t.get("baseVolume") or 0) * float(t.get("last") or t.get("close") or 0)
+
+        missing.sort(key=lambda it: -volume(it[1]))
+        out: dict[str, Quote] = {}
+        for inst, t in missing[:_BOOK_FALLBACK_MAX]:
+            try:
+                q = self.fetch_order_book_quote(inst)
+            except Exception as exc:
+                log.debug("%s: book quote for %s failed: %s", self.name, inst.symbol, exc)
+                continue
+            vol = volume(t)
+            out[inst.key] = Quote(
+                inst, q.bid, q.ask, q.bid_size, q.ask_size, q.ts, vol if vol else None
+            )
         return out
 
     def fetch_touch(self, inst: Instrument) -> Quote:
@@ -214,16 +269,63 @@ class CcxtVenue(Venue):
     def fetch_funding_history(
         self, inst: Instrument, since_ms: int, until_ms: int | None = None
     ) -> list[tuple[int, float]]:
-        params: dict = {"paginate": True, "paginationCalls": 500}
-        if until_ms is not None:
-            params["until"] = until_ms
-        rows = self.ex.fetch_funding_rate_history(inst.symbol, since_ms, None, params)
-        merged = {
-            int(r["timestamp"]): float(r["fundingRate"])
-            for r in rows
-            if r.get("timestamp") is not None and r.get("fundingRate") is not None
-        }
-        return sorted((ts, r) for ts, r in merged.items() if ts >= since_ms)
+        """Settled funding ``[(ts_ms, rate_per_interval)]``, paging forward from ``since``.
+
+        Not every venue honours ccxt's ``paginate`` (Hyperliquid returns one 500-row page),
+        so we also page manually until a call adds nothing new."""
+        if self.ex.id == "lighter":
+            return self._lighter_funding_history(inst, since_ms, until_ms)
+        end = until_ms or int(time.time() * 1000)
+        merged: dict[int, float] = {}
+        cursor = since_ms
+        for _ in range(2_000):
+            params: dict = {"paginate": True, "paginationCalls": 200}
+            if until_ms is not None:
+                params["until"] = until_ms
+            rows = self.ex.fetch_funding_rate_history(inst.symbol, cursor, None, params)
+            fresh = {
+                int(r["timestamp"]): float(r["fundingRate"])
+                for r in rows
+                if r.get("timestamp") is not None
+                and r.get("fundingRate") is not None
+                and int(r["timestamp"]) >= cursor
+            }
+            if not fresh or max(fresh) <= max(merged, default=-1):
+                break
+            merged.update(fresh)
+            cursor = max(fresh) + 1
+            if cursor >= end:
+                break
+        return sorted((ts, r) for ts, r in merged.items() if since_ms <= ts <= end)
+
+    def _lighter_funding_history(
+        self, inst: Instrument, since_ms: int, until_ms: int | None
+    ) -> list[tuple[int, float]]:
+        """Lighter /api/v1/fundings: hourly rows, ``rate`` an unsigned hourly *percent*,
+        ``direction`` 'short' meaning shorts pay (negative funding), timestamps in seconds.
+        Units come from third-party reverse engineering; check a few rows against the app."""
+        market_id = int(self.ex.market(inst.symbol)["id"])
+        end_s = (until_ms or int(time.time() * 1000)) // 1000
+        start_s = since_ms // 1000
+        out: dict[int, float] = {}
+        while start_s < end_s:
+            chunk_end = min(end_s, start_s + 700 * 3600)  # API returns at most 750 rows
+            resp = self.ex.publicGetFundings(
+                {
+                    "market_id": market_id,
+                    "resolution": "1h",
+                    "start_timestamp": start_s,
+                    "end_timestamp": chunk_end,
+                    "count_back": 0,
+                }
+            )
+            for row in resp.get("fundings") or []:
+                sign = -1.0 if str(row.get("direction", "")).lower() == "short" else 1.0
+                ts_ms = int(row["timestamp"]) * 1000
+                if ts_ms >= since_ms:
+                    out[ts_ms] = sign * float(row["rate"]) / 100.0
+            start_s = chunk_end
+        return sorted(out.items())
 
     # ------------------------------------------------------------------ trading
     def _unit(self, inst: Instrument) -> float:
@@ -242,6 +344,10 @@ class CcxtVenue(Venue):
         market = self.ex.market(inst.symbol)
         mn = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0.0
         return float(mn) * self._unit(inst)
+
+    def min_notional(self, inst: Instrument) -> float:
+        market = self.ex.market(inst.symbol)
+        return float(((market.get("limits") or {}).get("cost") or {}).get("min") or 0.0)
 
     @property
     def supports_post_only(self) -> bool:  # type: ignore[override]
@@ -315,7 +421,15 @@ class CcxtVenue(Venue):
         params: dict = {"timeInForce": "IOC"}
         if reduce_only and inst.is_perp:
             params["reduceOnly"] = True
-        order = self.ex.create_order(inst.symbol, "limit", order_side, amount, price, params)
+        import ccxt
+
+        try:
+            order = self.ex.create_order(inst.symbol, "limit", order_side, amount, price, params)
+        except ccxt.InvalidOrder as exc:
+            # Hyperliquid reports an IOC with nothing to match as an error, not a 0 fill
+            if "immediately match" in str(exc).lower():
+                return Fill(inst, order_side, 0.0, limit_price, 0.0, None)
+            raise
         if order.get("filled") is None or order.get("status") in (None, "open"):
             try:
                 order = self.ex.fetch_order(order["id"], inst.symbol)

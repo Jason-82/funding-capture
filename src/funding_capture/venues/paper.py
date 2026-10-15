@@ -109,6 +109,9 @@ class PaperVenue(Venue):
     def min_qty(self, inst: Instrument) -> float:
         return self.data.min_qty(inst)
 
+    def min_notional(self, inst: Instrument) -> float:
+        return self.data.min_notional(inst)
+
     # -- simulated trading ------------------------------------------------------------
     def _book(self, inst: Instrument) -> _Book:
         return self.state.books.setdefault(inst.key, _Book())

@@ -10,6 +10,7 @@ from .models import HOURS_PER_YEAR, Candidate, Kind
 DEFAULT_INTERVAL_HOURS: dict[str, float] = {
     "hyperliquid": 1.0,
     "dydx": 1.0,
+    "lighter": 1.0,
     "paradex": 8.0,
     "binance": 8.0,
     "bybit": 8.0,

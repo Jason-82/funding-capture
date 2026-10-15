@@ -143,6 +143,12 @@ class PairExecutor:
     def _quotes(self, legs: list[_LegPlan]):
         return [self.venues[leg.inst.venue].fetch_touch(leg.inst) for leg in legs]
 
+    def _min_qty(self, a: _LegPlan, b: _LegPlan, price: float) -> float:
+        """Smallest slice both venues accept, incl. min order value (10% buffer)."""
+        va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
+        min_value = max(va.min_notional(a.inst), vb.min_notional(b.inst)) * 1.1
+        return max(va.min_qty(a.inst), vb.min_qty(b.inst), min_value / price)
+
     def _round_both(self, a: _LegPlan, b: _LegPlan, qty: float) -> float:
         va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
         q = va.round_qty(a.inst, qty)
@@ -200,8 +206,8 @@ class PairExecutor:
         depth = [q.touch(leg.order_side)[1] * q.mid for leg, q in zip(legs, quotes, strict=True)]
         first, second = (0, 1) if depth[0] <= depth[1] else (1, 0)
         a, b = legs[first], legs[second]
-        va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
-        min_qty = max(va.min_qty(a.inst), vb.min_qty(b.inst))
+        vb = self.venues[b.inst.venue]
+        min_qty = self._min_qty(a, b, quotes[first].mid)
 
         remaining = target_qty
         misses = 0
@@ -249,9 +255,9 @@ class PairExecutor:
         self, m: _LegPlan, h: _LegPlan, legs: list[_LegPlan], target_qty: float
     ) -> ExecutionReport:
         rep = ExecutionReport()
-        vm, vh = self.venues[m.inst.venue], self.venues[h.inst.venue]
-        min_qty = max(vm.min_qty(m.inst), vh.min_qty(h.inst))
+        vm = self.venues[m.inst.venue]
         ref_mid = self._quotes([m])[0].mid
+        min_qty = self._min_qty(m, h, ref_mid)
         remaining = target_qty
         rejects = 0
         carry = _Carry()

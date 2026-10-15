@@ -174,3 +174,128 @@ def test_credentials_from_env(monkeypatch):
     monkeypatch.setenv("OKX_PASSWORD", "p")
     assert credentials_from_env("okx") == {"apiKey": "k", "secret": "s", "password": "p"}
     assert credentials_from_env("bybit") == {}
+
+
+# --------------------------------------------------------------------- venue quirks
+def _hl():
+    ex = ccxt.hyperliquid({"options": {"builderFee": False}})
+    kpepe = _market("KPEPE/USDC:USDC", "KPEPE", "swap", amount_step=1, price_step=1e-6)
+    kpepe.update(
+        quote="USDC",
+        settle="USDC",
+        baseName="kPEPE",
+        limits={"amount": {"min": None}, "price": {}, "cost": {"min": 10}},
+    )
+    btc = _market("BTC/USDC:USDC", "BTC", "swap", amount_step=0.00001, price_step=1)
+    btc.update(
+        quote="USDC",
+        settle="USDC",
+        baseName="BTC",
+        limits={"amount": {"min": None}, "price": {}, "cost": {"min": 10}},
+    )
+    ubtc = _market("BTC/USDC", "BTC", "spot", amount_step=0.00001, price_step=1)
+    ubtc.update(quote="USDC", baseName="UBTC")
+    ex.set_markets([kpepe, btc, ubtc])
+    return CcxtVenue("hyperliquid", exchange=ex, quotes=("USDC",))
+
+
+def test_default_options_disable_builder_fees():
+    v = CcxtVenue("hyperliquid")
+    assert v.ex.options["builderFee"] is False
+    assert v.ex.options["fetchMarkets"]["types"] == ["spot", "swap"]  # no HIP-3 stock perps
+    v2 = CcxtVenue("hyperliquid", options={"builderFee": True})  # explicit config wins
+    assert v2.ex.options["builderFee"] is True
+
+
+def test_hyperliquid_k_prefixed_perps_and_min_notional():
+    v = _hl()
+    insts = {i.symbol: i for i in v.load_instruments()}
+    assert (insts["KPEPE/USDC:USDC"].asset, insts["KPEPE/USDC:USDC"].multiplier) == ("PEPE", 1e3)
+    assert insts["BTC/USDC"].kind is Kind.SPOT and insts["BTC/USDC"].asset == "BTC"
+    assert v.min_notional(insts["BTC/USDC:USDC"]) == 10
+
+
+def test_ioc_that_cannot_match_is_a_zero_fill():
+    v = _hl()
+    perp = next(i for i in v.load_instruments() if i.symbol == "BTC/USDC:USDC")
+
+    def reject(*a, **k):
+        raise ccxt.InvalidOrder("Order could not immediately match against any resting orders.")
+
+    v.ex.create_order = reject
+    assert v.place_ioc(perp, "buy", 0.001, 60_000).qty == 0
+
+    def other(*a, **k):
+        raise ccxt.InvalidOrder("Order must have minimum value of $10")
+
+    v.ex.create_order = other
+    with pytest.raises(ccxt.InvalidOrder):
+        v.place_ioc(perp, "buy", 0.00001, 60_000)
+
+
+def test_spot_without_ticker_bid_ask_uses_order_book():
+    v = _hl()
+    spot_btc = next(i for i in v.load_instruments() if i.symbol == "BTC/USDC")
+    v.ex.fetch_tickers = lambda symbols: {
+        s: {"bid": None, "ask": None, "close": 60_000, "quoteVolume": 5e6} for s in symbols
+    }
+    v.ex.fetch_order_book = lambda symbol, limit=None: {
+        "bids": [[59_990, 0.5]],
+        "asks": [[60_010, 0.4]],
+        "timestamp": 1,
+    }
+    q = v.fetch_quotes([spot_btc])[spot_btc.key]
+    assert (q.bid, q.ask, q.ask_size, q.volume_usd_24h) == (59_990, 60_010, 0.4, 5e6)
+
+
+def test_history_pages_forward_when_venue_returns_one_page():
+    v = _hl()
+    perp = next(i for i in v.load_instruments() if i.symbol == "BTC/USDC:USDC")
+    h = 3_600_000
+    calls = []
+
+    def page(symbol, since, limit, params):  # 500-row pages, like Hyperliquid
+        calls.append(since)
+        first = -(-since // h) * h  # settlements sit on the hour grid
+        return [
+            {"timestamp": first + k * h, "fundingRate": 1e-5}
+            for k in range(500)
+            if first + k * h <= 1_200 * h
+        ]
+
+    v.ex.fetch_funding_rate_history = page
+    rows = v.fetch_funding_history(perp, 0, until_ms=1_200 * h)
+    assert len(rows) == 1_201 and rows[0][0] == 0 and rows[-1][0] == 1_200 * h
+    assert len(calls) == 3
+
+
+def test_lighter_rates_are_normalised_to_hourly():
+    ex = ccxt.lighter()
+    m = _market("ETH/USDC:USDC", "ETH", "swap")
+    m.update(id="0", quote="USDC", settle="USDC")
+    ex.set_markets([m])
+    v = CcxtVenue("lighter", exchange=ex, quotes=("USDC",))
+    (eth,) = v.load_instruments()
+    # /funding-rates reports an 8h-equivalent fraction (ccxt passes it through as-is)
+    ex.fetch_funding_rates = lambda symbols: {eth.symbol: {"fundingRate": 0.000096}}
+    snap = v.fetch_funding()[eth.key]
+    assert snap.interval_hours == 1
+    assert snap.rate == pytest.approx(0.000012)  # = 0.0012% per hour, as the app shows
+    assert snap.next_funding_ts % 3_600_000 == 0
+
+    calls = []
+
+    def fundings(params):
+        calls.append(params)
+        s = params["start_timestamp"]
+        return {
+            "fundings": [
+                {"timestamp": s + 3600, "rate": "0.0012", "direction": "long"},
+                {"timestamp": s + 7200, "rate": "0.0030", "direction": "short"},
+            ]
+        }
+
+    ex.publicGetFundings = fundings
+    rows = v.fetch_funding_history(eth, 0, until_ms=3_600_000 * 10)
+    assert calls[0]["market_id"] == 0 and calls[0]["resolution"] == "1h"
+    assert rows == [(3_600_000, pytest.approx(0.000012)), (7_200_000, pytest.approx(-0.00003))]

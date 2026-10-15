@@ -48,6 +48,10 @@ class Venue(ABC):
     def min_qty(self, inst: Instrument) -> float:
         return 0.0
 
+    def min_notional(self, inst: Instrument) -> float:
+        """Smallest order value in USD the venue accepts (Hyperliquid: $10)."""
+        return 0.0
+
     @abstractmethod
     def place_ioc(
         self,
