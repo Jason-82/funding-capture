@@ -1,4 +1,5 @@
-"""Command line: fcap check | scan | fetch | record | backtest | sweep | paper | live | status."""
+"""Command line: fcap check | markets | scan | record | import-funding | fetch | backtest | sweep
+| paper | live | status."""
 
 from __future__ import annotations
 
@@ -227,6 +228,26 @@ def cmd_fetch(args, settings: Settings) -> None:
     save_universe(store, venue_instruments, venue_perps)
 
 
+def cmd_markets(args, settings: Settings) -> None:
+    """List a venue's markets as the bot sees them (symbol, asset, size per contract)."""
+    from .models import Kind
+
+    venue = _data_venues(settings, [args.venue])[args.venue]
+    insts = sorted(venue.load_instruments(), key=lambda i: (i.kind.value, i.asset))
+    if args.kind:
+        insts = [i for i in insts if i.kind is Kind(args.kind)]
+    marks = {}
+    perps = [i for i in insts if i.is_perp]
+    if perps:
+        marks = {k: s.mark_price for k, s in venue.fetch_funding(perps).items()}
+    print(f"{'symbol':<24} {'kind':<5} {'asset':<10} {'units/contract':>15} {'$/contract':>11}")
+    for i in insts:
+        unit = i.multiplier * (i.contract_size if i.is_perp else 1.0)
+        mark = marks.get(i.key)
+        value = f"{unit * mark:>11,.2f}" if mark else f"{'':>11}"
+        print(f"{i.symbol:<24} {i.kind.value:<5} {i.asset:<10} {unit:>15,.6g} {value}")
+
+
 def cmd_record(args, settings: Settings) -> None:
     """Log published funding forward into the history store (for venues with no history
     API, e.g. Coinbase US perps). The last reading before each settlement is kept."""
@@ -398,6 +419,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--top", type=int, default=25)
     s.add_argument("--all", action="store_true", help="include rows failing liquidity filters")
     s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("markets", help="list a venue's markets and contract sizes")
+    s.add_argument("--venue", required=True)
+    s.add_argument("--kind", choices=["spot", "perp"])
+    s.set_defaults(fn=cmd_markets)
 
     s = sub.add_parser("record", help="log funding forward (venues without a history API)")
     s.add_argument("--venues", help="comma list (default: all configured)")

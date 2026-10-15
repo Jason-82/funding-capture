@@ -123,3 +123,12 @@ def test_read_funding_csv_variants(tmp_path):
     b = tmp_path / "b.csv"
     b.write_text("ts,rate\n1790812800,0.00002\n")
     assert read_funding_csv(b) == [(1_790_812_800_000, pytest.approx(0.00002))]
+
+
+def test_us_config_loads():
+    s = load_settings(EXAMPLE.parent / "config.us.yaml")
+    assert [v.name for v in s.venues] == ["coinbase", "kraken"]
+    assert s.venues[1].kinds == ("spot",)
+    assert s.costs.fees["coinbase"].perp_min_fee_per_contract == 0.20
+    assert s.costs.maker_venues == ("kraken", "coinbase")
+    assert s.strategy.forecast.anchor_hourly == 0.0

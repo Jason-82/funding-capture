@@ -1,0 +1,84 @@
+# US setup: copy to config.yaml and edit. See docs/RUNBOOK_US.md for the full walkthrough.
+#
+# Trade: long spot on Kraken Pro or Coinbase, short Coinbase's CFTC-regulated US
+# perpetual-style futures (~20 coins, hourly funding) when their funding is positive.
+#
+# Not here on purpose: Hyperliquid and Lighter. Their terms of use exclude US persons.
+# Kraken's US perps (via Bitnomial) have no retail API yet. Kalshi's perps have no ccxt
+# support (and few coins).
+
+mode: paper            # paper | live (live also needs the CLI confirmation flag)
+data_dir: data
+
+venues:
+  coinbase:
+    quotes: [USD, USDC]          # spot pairs + US perps (perps are USD-margined)
+    paper_leverage: 1.0          # paper liquidation model; real margin is per account
+  kraken:
+    quotes: [USD, USDC]          # USD books are far deeper than USDC on Kraken
+    kinds: [spot]
+    # dead_man_seconds: 120      # live: Kraken cancels ALL your open orders if the bot
+    #                            # stops refreshing this for 2 minutes. Recommended only on
+    #                            # an account (or sub-account) used just by the bot.
+
+# Your real fee tier decides which trades pass. `fcap check` prints your spot rates once
+# API keys are set; put them here. Fractions: 0.005 = 0.50%.
+fees:
+  coinbase:
+    spot_taker: 0.0090
+    spot_maker: 0.0050
+    perp_taker: 0.0002
+    perp_maker: 0.0002
+    perp_min_fee_per_contract: 0.20   # USD per contract per side; confirm with an order preview
+  kraken:
+    spot_taker: 0.0080
+    spot_maker: 0.0040
+
+costs:
+  maker_venues: [kraken, coinbase]   # rest a post-only order on the spot leg, hedge each fill
+  slippage_bps: 5                    # on taker fills (the perp leg)
+  perp_leverage: 1.0   # CFM overnight margin on short alt perps is ~30-95% of notional,
+                       # so budget ~1x. A spot+perp pair then ties up ~2x its notional.
+
+strategy:
+  constructions: [spot_perp]
+  cross_venue_spot: true             # Kraken spot can hedge a Coinbase perp
+  horizon_hours: 720                 # spot fees are high: plan on ~a month per position
+  entry_apr: 0.15                    # forecast APR on *capital* after round-trip costs
+  exit_apr: -0.02                    # re-entering is expensive; ride out brief dips
+  max_breakeven_hours: 336
+  forecast:
+    halflife_hours: 48
+    reversion_halflife_hours: 168
+    anchor_apr: 0.0                  # Coinbase's funding has no built-in interest term
+    live_weight: 0.5
+
+portfolio:
+  capital_usd: 5000
+  max_positions: 4
+  max_positions_per_asset: 1
+  max_position_usd: 1000             # notional per pair (BTC contract ~$1k; SHIB ~$55)
+  min_position_usd: 100
+  min_volume_usd: 250000             # 24h volume on BOTH legs; US perps are thin
+  max_spread_bps: 25
+  settlement_guard_minutes: 5
+  risk_cooldown_minutes: 240
+  state_dir: state
+  loop_seconds: 60
+
+risk:
+  min_liq_distance: 0.20             # also used for Coinbase's account liquidation buffer
+  warn_liq_distance: 0.35
+  max_leg_divergence: 0.03
+  max_loss_frac: 0.03
+  max_data_age_s: 180
+
+execution:
+  max_slice_usd: 1000
+  maker_timeout_s: 120
+  maker_poll_s: 3
+  maker_requote_bps: 8
+
+backtest:
+  warmup_hours: 72
+  max_leg_abs_apr: 5.0

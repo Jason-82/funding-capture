@@ -119,6 +119,10 @@ These are the knobs, and each maps to config so the backtest/sweep can test it:
    perps (Hyperliquid, dYdX…). *Hypothesis to test*: CEX↔DEX spreads are wider and more
    persistent than CEX↔CEX because of different user bases, formulas, caps and intervals,
    and less arbitrage capital. The data will say.
+   *US persons*: Hyperliquid, Lighter and most offshore perp venues exclude you in their
+   terms. The compliant set is much smaller (Coinbase's CFTC-regulated perpetual-style
+   futures, plus spot on Coinbase/Kraken) and spot fees there are 5–10x offshore levels.
+   See [RUNBOOK_US.md](RUNBOOK_US.md).
 2. **Universe** (`min_volume_usd`, `include_assets`, `max_leg_abs_apr`). Majors have low
    funding, deep books and huge capacity. Mid-caps have higher funding and adequate
    liquidity, and are probably where the edge is. The long tail and new listings show

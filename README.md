@@ -47,6 +47,13 @@ fcap -c config.yaml paper
 # 6. Positions and P&L of the running (or last) paper engine
 fcap -c config.yaml status
 
+# Venues with no funding-history API (Coinbase US perps): log it forward, or import a CSV
+fcap -c config.yaml record
+fcap -c config.yaml import-funding --venue coinbase --symbol BIP-20DEC30-CDE --file f.csv
+
+# Symbols and contract sizes as the bot sees them
+fcap -c config.yaml markets --venue coinbase --kind perp
+
 # 7. Real orders (needs `mode: live` in config, API keys in env or .env, and the flag)
 fcap -c config.yaml live --i-understand-this-trades-real-money
 ```
@@ -84,6 +91,7 @@ src/funding_capture/
   data.py            on-disk funding history + ccxt downloader
   backtest.py        hourly event-driven backtest, walk-forward sweep
   venues/ccxt_venue  ccxt adapter (data + orders), unit conversion at the boundary
+  venues/coinbase    Coinbase spot + US perpetual-style futures via raw Advanced Trade calls
   venues/paper.py    simulated fills/funding on top of live data
   execution.py       two-leg IOC executor: thin leg first, hedge, unwind on failure
   risk.py            delta drift / ADL, liquidation distance, divergence, stop loss
