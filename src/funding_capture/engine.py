@@ -524,7 +524,9 @@ class Engine:
         for q in (ql, qs):
             if (q.volume_usd_24h or 0.0) < self.cfg.min_volume_usd:
                 return False
-            if q.spread_bps > self.cfg.max_spread_bps:
+            # a leg worked with post-only orders joins the bid/ask instead of paying the spread
+            maker = q.instrument.venue in self.costs.maker_venues
+            if q.spread_bps > self.cfg.max_spread_bps * (4 if maker else 1):
                 return False
         div = price_divergence(ql.mid, qs.mid)
         return div is not None and div <= self.limits.warn_leg_divergence

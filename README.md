@@ -7,7 +7,9 @@ continuous risk monitoring.
 
 Start with [docs/STRATEGY.md](docs/STRATEGY.md). It covers the search space (which
 hedged constructions exist, the cost and capital arithmetic, the risks) and the plan for
-validating the idea before risking money.
+validating the idea before risking money. **In the US?** Follow
+[docs/RUNBOOK_US.md](docs/RUNBOOK_US.md): it walks through every step on your own
+machine and covers which venues US persons can actually trade.
 
 > **Status:** The data, backtest and paper paths are covered by offline tests. The live
 > order path is written against ccxt's unified API but has **never been run against a
@@ -24,6 +26,9 @@ cp config.example.yaml config.yaml   # edit venues, fees, sizing
 ## Workflow
 
 ```bash
+# 0. Connectivity, market data and (once keys are set) account access per venue
+fcap -c config.yaml check
+
 # 1. What's on offer right now (public data, no keys)
 fcap -c config.yaml scan --top 30
 
@@ -39,12 +44,20 @@ fcap -c config.yaml sweep
 # 5. Paper trade on live data with simulated fills and funding
 fcap -c config.yaml paper
 
-# 6. Real orders (needs `mode: live` in config, API keys in env, and the flag)
+# 6. Positions and P&L of the running (or last) paper engine
+fcap -c config.yaml status
+
+# 7. Real orders (needs `mode: live` in config, API keys in env or .env, and the flag)
 fcap -c config.yaml live --i-understand-this-trades-real-money
 ```
 
-Kill switches while the engine runs: `touch state/STOP` blocks new entries;
-`touch state/FLATTEN` closes every pair and stops opening new ones.
+Paper and live keep separate state in `state/paper/` and `state/live/`. Kill switches
+while the engine runs: `touch state/<mode>/STOP` blocks new entries;
+`touch state/<mode>/FLATTEN` closes every pair and stops opening new ones.
+
+Legs on venues listed in `costs.maker_venues` are worked with post-only orders (rest at
+the touch, hedge each fill immediately on the other leg). That matters on venues where
+taker fees are high, such as US spot exchanges.
 
 ## What it trades
 
@@ -87,9 +100,10 @@ ruff check src tests
 
 ## Safety notes
 
-* API keys come from environment variables only (`BINANCE_API_KEY`, `BINANCE_SECRET`,
-  `OKX_PASSWORD`, `HYPERLIQUID_WALLET_ADDRESS`, `HYPERLIQUID_PRIVATE_KEY`, …). Create keys
-  with trading permission only, no withdrawals, and IP-allowlist them.
+* API keys come from environment variables or a git-ignored `.env` file
+  (`<VENUE>_API_KEY`, `<VENUE>_SECRET`, `<VENUE>_PASSWORD`, `<VENUE>_WALLET_ADDRESS`,
+  `<VENUE>_PRIVATE_KEY`; any of them can be `<NAME>_FILE=/path` instead, for PEM keys).
+  Create keys with trading permission only, no withdrawals, and IP-allowlist them.
 * Give the bot dedicated sub-accounts. It assumes it owns every position on the
   instruments it trades, and closes positions it believes are unhedged.
 * Check that you are legally allowed to use each venue from where you live.
