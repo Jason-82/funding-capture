@@ -20,6 +20,7 @@ Start with one contract and check every field ``fcap check`` prints.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -42,6 +43,16 @@ def _f(value, default: float = 0.0) -> float:
         return default
 
 
+def _json_in(text: str):
+    i = text.find("{")
+    if i < 0:
+        return None
+    try:
+        return json.loads(text[i:])
+    except ValueError:
+        return None
+
+
 def _ms(iso: str | None) -> int | None:
     if not iso:
         return None
@@ -54,9 +65,16 @@ def _ms(iso: str | None) -> int | None:
 class CoinbaseVenue(CcxtVenue):
     reports_funding = False  # no funding-payment history in the Advanced Trade API
 
-    def __init__(self, *args, ioc_config: str = "sor_limit_ioc", **kwargs):
-        kwargs.setdefault("quotes", ("USD", "USDC"))
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        name: str,
+        ccxt_id: str | None = None,
+        quotes: tuple[str, ...] = ("USD", "USDC"),
+        *args,
+        ioc_config: str = "sor_limit_ioc",
+        **kwargs,
+    ):
+        super().__init__(name, ccxt_id, quotes, *args, **kwargs)
         self.ioc_config = ioc_config
         self._products: dict[str, dict] = {}  # product_id -> last products row
         self._products_ms = 0
@@ -121,8 +139,11 @@ class CoinbaseVenue(CcxtVenue):
             for pid, p in self._refresh_products(0).items():
                 if not self._is_perp(p):
                     continue
+                fpd = p.get("future_product_details") or {}
                 asset, mult = canonical_asset(self._base_unit(p), self.aliases)
-                size = _f((p.get("future_product_details") or {}).get("contract_size"), 0.0)
+                if fpd.get("contract_root_unit"):  # e.g. 'ZCASH PERP' has root unit ZEC
+                    asset = canonical_asset(fpd["contract_root_unit"], self.aliases)[0]
+                size = _f(fpd.get("contract_size"), 0.0)
                 if not asset or size <= 0:
                     continue
                 self._by_symbol[pid] = Instrument(
@@ -144,12 +165,15 @@ class CoinbaseVenue(CcxtVenue):
             fpd = p.get("future_product_details") or {}
             mark = _f(p.get("mid_market_price")) or _f(p.get("price"))
             index = _f(fpd.get("index_price"))
+            next_ts = _ms(fpd.get("funding_time"))
+            if next_ts is not None and next_ts <= now:  # API dumps show the last settlement
+                next_ts += ((now - next_ts) // 3_600_000 + 1) * 3_600_000
             out[inst.key] = FundingSnapshot(
                 instrument=inst,
                 rate=_f(fpd.get("funding_rate")),
                 interval_hours=1.0,
                 ts=now,
-                next_funding_ts=_ms(fpd.get("funding_time")),
+                next_funding_ts=next_ts,
                 mark_price=mark / inst.multiplier if mark else None,
                 index_price=index / inst.multiplier if index else None,
             )
@@ -231,17 +255,30 @@ class CoinbaseVenue(CcxtVenue):
         return 0.0 if inst.is_perp else super().min_notional(inst)
 
     def _create(self, inst, side, contracts, config_name, limit_px, post_only=False) -> dict:
+        """POST an order; a rejection comes back as Coinbase's response dict.
+
+        ccxt raises ExchangeError('coinbase ' + body) for any reply carrying
+        ``error_response`` (even HTTP 200); we recover the body so callers can read the
+        rejection reason."""
+        import ccxt
+
         cfg = {"base_size": str(int(contracts)), "limit_price": limit_px}
         if config_name == "limit_limit_gtc":
             cfg["post_only"] = post_only
-        return self.ex.v3PrivatePostBrokerageOrders(
-            {
-                "client_order_id": f"fc-{uuid.uuid4()}",
-                "product_id": inst.symbol,
-                "side": side.upper(),
-                "order_configuration": {config_name: cfg},
-            }
-        )
+        try:
+            return self.ex.v3PrivatePostBrokerageOrders(
+                {
+                    "client_order_id": f"fc-{uuid.uuid4()}",
+                    "product_id": inst.symbol,
+                    "side": side.upper(),
+                    "order_configuration": {config_name: cfg},
+                }
+            )
+        except ccxt.ExchangeError as exc:
+            body = _json_in(str(exc))
+            if isinstance(body, dict) and ("error_response" in body or "success" in body):
+                return body
+            raise
 
     @staticmethod
     def _order_id(resp: dict) -> tuple[str | None, str]:
@@ -299,7 +336,14 @@ class CoinbaseVenue(CcxtVenue):
 
     def place_post_only(self, inst, order_side, qty, price, reduce_only=False):
         if not inst.is_perp:
-            return super().place_post_only(inst, order_side, qty, price, reduce_only)
+            import ccxt
+
+            try:
+                return super().place_post_only(inst, order_side, qty, price, reduce_only)
+            except ccxt.ExchangeError as exc:
+                if "POST_ONLY" in str(exc):  # INVALID_LIMIT_PRICE_POST_ONLY: would cross
+                    return None
+                raise
         contracts = round(self.round_qty(inst, qty) / self._unit(inst))
         if contracts < 1:
             return None
@@ -319,12 +363,10 @@ class CoinbaseVenue(CcxtVenue):
         return self._state(inst, order_id)
 
     def cancel_order(self, inst, order_id) -> OrderState:
-        if not inst.is_perp:
-            return super().cancel_order(inst, order_id)
+        """Cancel via batch_cancel (its per-order result is ignored: an order that just
+        filled 'fails' to cancel) and return the confirmed final state, fills included."""
         self.ex.v3PrivatePostBrokerageOrdersBatchCancel({"order_ids": [order_id]})
-        st = self._state(inst, order_id)
-        st.is_open = False
-        return st
+        return self._settled(inst, order_id)
 
     def fetch_perp_positions(self) -> dict[str, PerpPositionInfo]:
         if not self._perp_kind_enabled():

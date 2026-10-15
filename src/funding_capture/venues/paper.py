@@ -142,7 +142,7 @@ class PaperVenue(Venue):
         fill_qty = self.round_qty(inst, fill_qty)
         if fill_qty <= 0:
             return empty
-        fee = fill_qty * price * self.fees.fee(inst.kind, taker=True)
+        fee = self.fees.fill_fee_usd(inst, fill_qty, price, taker=True)
         self._apply(book, sign * fill_qty, price)
         self.state.fees_usd += fee
         if inst.is_perp and inst.key not in self.state.pending:
@@ -175,7 +175,7 @@ class PaperVenue(Venue):
                 sign = 1 if o.side == "buy" else -1
                 if o.reduce_only:
                     qty = min(qty, max(0.0, -sign * book.qty))
-                fee = qty * o.price * self.fees.fee(inst.kind, taker=False)
+                fee = self.fees.fill_fee_usd(inst, qty, o.price, taker=False)
                 self._apply(book, sign * qty, o.price)
                 self.state.fees_usd += fee
                 o.filled += qty

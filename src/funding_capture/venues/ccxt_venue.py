@@ -50,8 +50,12 @@ def credentials_from_env(venue: str) -> dict[str, str]:
         name = f"{prefix}_{suffix}"
         value = os.environ.get(name)
         if not value and os.environ.get(f"{name}_FILE"):
-            with open(os.path.expanduser(os.environ[f"{name}_FILE"])) as f:
-                value = f.read().strip()
+            path = os.path.expanduser(os.environ[f"{name}_FILE"])
+            try:
+                with open(path) as f:
+                    value = f.read().strip()
+            except OSError as exc:
+                raise ValueError(f"{name}_FILE: cannot read {path}: {exc.strerror}") from None
         if value:
             out[field] = value.replace("\\n", "\n")
     return out
@@ -77,6 +81,9 @@ _ORDER_PARAMS: dict[str, dict] = {"kraken": {"oflags": "fciq"}}
 # Venues whose ccxt funding rate is quoted per N hours although they settle hourly.
 # Lighter's /funding-rates normalises every venue to an 8h-equivalent fraction.
 _RATE_QUOTED_PER_HOURS: dict[str, float] = {"lighter": 8.0}
+
+# Funding-history page sizes for venues whose ccxt pagination is deterministic (8h steps).
+_HISTORY_PAGE: dict[str, int] = {"binance": 1000, "okx": 100, "gate": 1000, "bingx": 1000}
 
 # Up to this many instruments without a usable ticker bid/ask get an order-book quote.
 _BOOK_FALLBACK_MAX = 20
@@ -121,6 +128,12 @@ class CcxtVenue(Venue):
             # before every order; there is nothing to approve, so skip it
             exchange.handle_builder_fee_approval = lambda *a, **k: True
         self.dead_man_seconds = dead_man_seconds
+        has = getattr(exchange, "has", None) or {}
+        # Without fetchOrder we cannot learn what an order filled (ccxt lighter): such a
+        # venue is for scanning/backtesting only. Without fetchFundingHistory the engine
+        # estimates funding from published rates.
+        self.can_trade = bool(has.get("fetchOrder"))
+        self.reports_funding = bool(has.get("fetchFundingHistory"))
         self._by_symbol: dict[str, Instrument] = {}
         self._intervals: dict[str, float] = {}
 
@@ -308,11 +321,14 @@ class CcxtVenue(Venue):
         end = until_ms or int(time.time() * 1000)
         merged: dict[int, float] = {}
         cursor = since_ms
+        # ccxt's paginate for these venues steps a fixed 8h x page size, which skips months
+        # on 1h/4h markets; page them ourselves with the venue's max page size instead
+        page = _HISTORY_PAGE.get(self.ex.id)
         for _ in range(2_000):
-            params: dict = {"paginate": True, "paginationCalls": 200}
+            params: dict = {} if page else {"paginate": True, "paginationCalls": 200}
             if until_ms is not None:
                 params["until"] = until_ms
-            rows = self.ex.fetch_funding_rate_history(inst.symbol, cursor, None, params)
+            rows = self.ex.fetch_funding_rate_history(inst.symbol, cursor, page, params)
             fresh = {
                 int(r["timestamp"]): float(r["fundingRate"])
                 for r in rows
@@ -407,6 +423,7 @@ class CcxtVenue(Venue):
     def place_post_only(self, inst, order_side, qty, price, reduce_only=False) -> str | None:
         import ccxt
 
+        self._require_trading()
         unit = self._unit(inst)
         amount = float(self.ex.amount_to_precision(inst.symbol, qty / unit))
         px = float(self.ex.price_to_precision(inst.symbol, price * inst.multiplier))
@@ -421,6 +438,10 @@ class CcxtVenue(Venue):
             if "post" in str(exc).lower():
                 return None
             raise
+        except ccxt.ExchangeError as exc:  # e.g. Coinbase INVALID_LIMIT_PRICE_POST_ONLY
+            if "POST_ONLY" in str(exc):
+                return None
+            raise
         if order.get("status") in ("canceled", "cancelled", "rejected", "expired"):
             return None  # some venues accept then cancel a post-only that would cross
         return str(order["id"])
@@ -431,11 +452,26 @@ class CcxtVenue(Venue):
     def cancel_order(self, inst, order_id) -> OrderState:
         import ccxt
 
-        with contextlib.suppress(ccxt.OrderNotFound):  # already filled/gone: state says which
+        # an order that already filled or is gone can make the cancel itself fail; the
+        # order's own state below is what counts
+        with contextlib.suppress(ccxt.OrderNotFound, ccxt.BadRequest, ccxt.InvalidOrder):
             self.ex.cancel_order(order_id, inst.symbol)
+        return self._settled(inst, order_id)
+
+    def _settled(self, inst, order_id, tries: int = 6, pause_s: float = 0.5) -> OrderState:
+        """Read an order until the venue reports it closed (cancels can be asynchronous).
+        Still open after that means unknown: the executor then halts entries."""
         st = self.fetch_order_state(inst, order_id)
-        st.is_open = False
+        for _ in range(tries - 1):
+            if not st.is_open:
+                break
+            time.sleep(pause_s)
+            st = self.fetch_order_state(inst, order_id)
         return st
+
+    def _require_trading(self) -> None:
+        if not self.can_trade:
+            raise RuntimeError(f"{self.name}: ccxt cannot confirm fills here; trading disabled")
 
     def place_ioc(
         self,
@@ -445,6 +481,7 @@ class CcxtVenue(Venue):
         limit_price: float,
         reduce_only: bool = False,
     ) -> Fill:
+        self._require_trading()
         unit = self._unit(inst)
         amount = float(self.ex.amount_to_precision(inst.symbol, qty / unit))
         price = float(self.ex.price_to_precision(inst.symbol, limit_price * inst.multiplier))

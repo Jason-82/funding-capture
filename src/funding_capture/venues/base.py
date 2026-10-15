@@ -13,6 +13,8 @@ class Venue(ABC):
     # False when the venue has no API for funding actually paid; the engine then estimates
     # it from observed rates and positions.
     reports_funding: bool = True
+    # False when orders can be sent but fills can't be confirmed: never trade on it.
+    can_trade: bool = True
 
     # -- market data -----------------------------------------------------------------
     @abstractmethod

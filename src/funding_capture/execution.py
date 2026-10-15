@@ -77,6 +77,9 @@ class ExecutionReport:
     residual: dict[str, float] = field(default_factory=dict)  # instrument key -> signed qty
     complete: bool = False
     messages: list[str] = field(default_factory=list)
+    # something went wrong in a way that leaves the true exposure uncertain (venue error,
+    # an order that could not be confirmed cancelled): the engine halts entries on this
+    unsafe: bool = False
 
     def _side(self, inst: Instrument, order_side: str) -> list[Fill]:
         return [f for f in self.fills if f.instrument == inst and f.order_side == order_side]
@@ -149,6 +152,15 @@ class PairExecutor:
         min_value = max(va.min_notional(a.inst), vb.min_notional(b.inst)) * 1.1
         return max(va.min_qty(a.inst), vb.min_qty(b.inst), min_value / price)
 
+    def _sendable(self, leg: _LegPlan, qty: float, price: float) -> float:
+        """``qty`` rounded to the venue's lot, or 0 if the venue would reject the order
+        (below its minimum size or minimum order value, with a 10% buffer)."""
+        v = self.venues[leg.inst.venue]
+        q = v.round_qty(leg.inst, qty)
+        if q <= 0 or q < v.min_qty(leg.inst) or q * price < v.min_notional(leg.inst) * 1.1:
+            return 0.0
+        return q
+
     def _round_both(self, a: _LegPlan, b: _LegPlan, qty: float) -> float:
         va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
         q = va.round_qty(a.inst, qty)
@@ -163,7 +175,7 @@ class PairExecutor:
         )
 
     def _maker_leg(self, legs: list[_LegPlan]) -> int | None:
-        """Index of the leg to work passively, if any (the pricier one if both qualify)."""
+        """Index of the leg to work passively, if any (the spot leg if both qualify)."""
         idx = [
             i
             for i, leg in enumerate(legs)
@@ -177,22 +189,45 @@ class PairExecutor:
         return 0 if legs[0].inst.kind == "spot" else 1
 
     def _hedge(self, b: _LegPlan, qty: float, rep: ExecutionReport) -> float:
-        """IOC ``qty`` on leg ``b`` with widening limits.
-
-        Returns what is still unhedged, *including* any remainder smaller than ``b``'s lot
-        size (callers tell the two apart with ``round_qty``)."""
-        vb = self.venues[b.inst.venue]
+        """IOC ``qty`` on leg ``b`` with widening limits. Returns what is still unhedged,
+        including any remainder too small for the venue to accept."""
         left = qty
         for attempt in range(self.p.hedge_retries):
-            lot = vb.round_qty(b.inst, left)
-            if lot <= 0:
+            if left <= 1e-12:
                 break
             touch_b, _ = self._quotes([b])[0].touch(b.order_side)
+            lot = self._sendable(b, left, touch_b)
+            if lot <= 0:
+                break
             fb = self._ioc(b, lot, touch_b, self.p.hedge_slippage_bps * (attempt + 1))
             if fb.qty > 0:
                 rep.fills.append(fb)
                 left -= fb.qty
         return max(left, 0.0)
+
+    def _finish(
+        self,
+        legs: list[_LegPlan],
+        rep: ExecutionReport,
+        target_qty: float,
+        price: float,
+        reason: str,
+    ) -> ExecutionReport:
+        """Flatten any one-sided excess (only ever called with nothing resting), then
+        record what is left and whether the execution did what was asked."""
+        try:
+            self._unwind_excess(legs, rep, price, reason)
+        except Exception as exc:  # the report must still reach the caller
+            rep.unsafe = True
+            rep.messages.append(f"unwind error: {exc}")
+            log.error("unwind error: %s", exc)
+        self._record_residual(legs, rep, price)
+        rep.complete = (
+            not rep.has_residual
+            and not rep.unsafe
+            and abs(target_qty - rep.hedged_qty) * price <= self.p.residual_tolerance_usd
+        )
+        return rep
 
     def _execute(
         self, legs: list[_LegPlan], target_qty: float, allow_maker: bool = True
@@ -202,54 +237,50 @@ class PairExecutor:
             return self._execute_maker(legs[m], legs[1 - m], legs, target_qty)
         rep = ExecutionReport()
         quotes = self._quotes(legs)
+        price = quotes[0].mid
         # thinner touch (in USD) goes first: it's the leg most likely to under-fill
         depth = [q.touch(leg.order_side)[1] * q.mid for leg, q in zip(legs, quotes, strict=True)]
         first, second = (0, 1) if depth[0] <= depth[1] else (1, 0)
         a, b = legs[first], legs[second]
-        vb = self.venues[b.inst.venue]
         min_qty = self._min_qty(a, b, quotes[first].mid)
-
+        reason = "sub-lot remainder"
         remaining = target_qty
         misses = 0
-        while remaining > 0:
-            qa, qb = self._quotes([a, b])
-            touch_a, size_a = qa.touch(a.order_side)
-            slice_qty = min(
-                remaining,
-                self.p.max_slice_usd / qa.mid,
-                size_a * self.p.touch_fraction,
-            )
-            slice_qty = self._round_both(a, b, slice_qty)
-            if slice_qty <= 0 or slice_qty < min_qty:
-                if remaining * qa.mid > self.p.residual_tolerance_usd:
-                    rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
-                break
-
-            fa = self._ioc(a, slice_qty, touch_a, self.p.entry_slippage_bps)
-            if fa.qty > 0:
-                rep.fills.append(fa)
-            else:
-                misses += 1
-                if misses >= self.p.max_first_leg_misses:
-                    rep.messages.append(f"first leg {a.inst.key} not filling; aborted")
+        carry = 0.0  # first-leg fills too small to hedge yet
+        try:
+            while remaining > 0:
+                qa = self._quotes([a])[0]
+                touch_a, size_a = qa.touch(a.order_side)
+                slice_qty = min(
+                    remaining, self.p.max_slice_usd / qa.mid, size_a * self.p.touch_fraction
+                )
+                slice_qty = self._round_both(a, b, slice_qty)
+                if slice_qty <= 0 or slice_qty < min_qty:
+                    if remaining * qa.mid > self.p.residual_tolerance_usd:
+                        rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
                     break
-                continue
-
-            need = self._hedge(b, fa.qty, rep)
-            rep.hedged_qty += fa.qty - need
-            remaining -= fa.qty
-            if need * qb.mid > self.p.residual_tolerance_usd:
-                failed = vb.round_qty(b.inst, need) > 0
-                self._unwind(a, need, rep, "hedge failed" if failed else "sub-lot remainder")
-                if failed:
-                    break  # the hedge venue is not cooperating; don't keep paying to retry
-
-        self._record_residual(legs, rep, quotes[0].mid)
-        rep.complete = (
-            not rep.has_residual
-            and abs(target_qty - rep.hedged_qty) * quotes[0].mid <= self.p.residual_tolerance_usd
-        )
-        return rep
+                fa = self._ioc(a, slice_qty, touch_a, self.p.entry_slippage_bps)
+                if fa.qty <= 0:
+                    misses += 1
+                    if misses >= self.p.max_first_leg_misses:
+                        rep.messages.append(f"first leg {a.inst.key} not filling; aborted")
+                        break
+                    continue
+                rep.fills.append(fa)
+                remaining -= fa.qty
+                want = fa.qty + carry
+                left = self._hedge(b, want, rep)
+                rep.hedged_qty += want - left
+                carry = left
+                if self._sendable(b, left, qa.mid) > 0:
+                    reason = "hedge failed"  # the hedge venue refused a sendable amount
+                    break
+        except Exception as exc:
+            rep.unsafe = True
+            reason = "execution error"
+            rep.messages.append(f"execution error: {exc}")
+            log.error("execution error on %s/%s: %s", a.inst.key, b.inst.key, exc)
+        return self._finish(legs, rep, target_qty, price, reason)
 
     def _execute_maker(
         self, m: _LegPlan, h: _LegPlan, legs: list[_LegPlan], target_qty: float
@@ -261,53 +292,67 @@ class PairExecutor:
         remaining = target_qty
         rejects = 0
         carry = _Carry()
+        reason = "sub-lot remainder"
         failed = timed_out = False
-        while remaining > 0 and not (failed or timed_out):
-            qm = self._quotes([m])[0]
-            price = qm.bid if m.order_side == "buy" else qm.ask  # join our side of the book
-            slice_qty = self._round_both(m, h, min(remaining, self.p.max_slice_usd / qm.mid))
-            if slice_qty <= 0 or slice_qty < min_qty:
-                if remaining * qm.mid > self.p.residual_tolerance_usd:
-                    rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
-                break
-            oid = vm.place_post_only(m.inst, m.order_side, slice_qty, price, m.reduce_only)
-            if oid is None:  # the book moved and we would have crossed; re-read and retry
-                rejects += 1
-                if rejects >= self.p.max_first_leg_misses:
-                    rep.messages.append(f"post-only on {m.inst.key} kept crossing; aborted")
+        started = self.clock()  # one budget across re-quotes; reset only on progress
+        try:
+            while remaining > 0 and not (failed or timed_out):
+                qm = self._quotes([m])[0]
+                price = qm.bid if m.order_side == "buy" else qm.ask  # join our side
+                slice_qty = self._round_both(m, h, min(remaining, self.p.max_slice_usd / qm.mid))
+                if slice_qty <= 0 or slice_qty < min_qty:
+                    if remaining * qm.mid > self.p.residual_tolerance_usd:
+                        rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
                     break
-                continue
-            seen = _Seen()
-            started = self.clock()
-            while True:
-                self.sleep(self.p.maker_poll_s)
-                st = vm.fetch_order_state(m.inst, oid)
-                if not self._absorb(m, h, st, seen, carry, rep):
-                    self._absorb(m, h, vm.cancel_order(m.inst, oid), seen, carry, rep)
-                    failed = True
+                if self.clock() - started >= self.p.maker_timeout_s:
+                    timed_out = True
                     break
-                if not st.is_open:
-                    break
-                expired = self.clock() - started >= self.p.maker_timeout_s
-                if not expired and not self._moved_away(m, price):
+                oid = vm.place_post_only(m.inst, m.order_side, slice_qty, price, m.reduce_only)
+                if oid is None:  # the book moved and we would have crossed; re-read
+                    rejects += 1
+                    if rejects >= self.p.max_first_leg_misses:
+                        rep.messages.append(f"post-only on {m.inst.key} kept crossing; aborted")
+                        break
                     continue
-                timed_out = expired  # otherwise: re-price at the new touch
-                if not self._absorb(m, h, vm.cancel_order(m.inst, oid), seen, carry, rep):
-                    failed = True
-                break
-            remaining -= seen.qty
+                seen = _Seen()
+                resting = True
+                try:
+                    while True:
+                        self.sleep(self.p.maker_poll_s)
+                        vm.heartbeat()  # keep a dead-man switch alive during long waits
+                        st = vm.fetch_order_state(m.inst, oid)
+                        resting = st.is_open
+                        if not self._absorb(m, h, st, seen, carry, rep, hedge=True):
+                            failed = True
+                            reason = "hedge failed"
+                            break
+                        if not resting:
+                            break
+                        expired = self.clock() - started >= self.p.maker_timeout_s
+                        if not expired and not self._moved_away(m, price):
+                            continue
+                        timed_out = expired  # otherwise: re-price at the new touch
+                        break
+                finally:
+                    if resting:  # never leave our order on the book when we stop looking
+                        final = vm.cancel_order(m.inst, oid)
+                        self._absorb(m, h, final, seen, carry, rep, hedge=not failed)
+                        if final.is_open:
+                            rep.unsafe = True
+                            rep.messages.append(f"order {oid} on {m.inst.key} may still be open")
+                remaining -= seen.qty
+                if seen.qty > 0:
+                    started = self.clock()
             if timed_out:
                 rep.messages.append(
                     f"maker order on {m.inst.key} timed out; {remaining:.6g} not traded"
                 )
-        if carry.qty * ref_mid > self.p.residual_tolerance_usd:
-            self._unwind(m, carry.qty, rep, "sub-lot remainder")
-        self._record_residual(legs, rep, ref_mid)
-        rep.complete = (
-            not rep.has_residual
-            and abs(target_qty - rep.hedged_qty) * ref_mid <= self.p.residual_tolerance_usd
-        )
-        return rep
+        except Exception as exc:
+            rep.unsafe = True
+            reason = "execution error"
+            rep.messages.append(f"execution error: {exc}")
+            log.error("maker execution error on %s: %s", m.inst.key, exc)
+        return self._finish(legs, rep, target_qty, ref_mid, reason)
 
     def _absorb(
         self,
@@ -317,30 +362,56 @@ class PairExecutor:
         seen: _Seen,
         carry: _Carry,
         rep: ExecutionReport,
+        hedge: bool = True,
     ) -> bool:
-        """Record new maker fills and hedge them. False if the hedge could not be done."""
+        """Record new maker fills and (if ``hedge``) hedge them plus any carried remainder.
+        Returns False if the hedge venue refused a sendable amount; the unhedged part is
+        left for ``_finish`` to unwind once our resting order has been cancelled."""
         new = st.filled - seen.qty
-        if new <= 1e-12:
+        if new > 1e-12:
+            cost_now = st.filled * (st.avg_price or 0.0)
+            price = (cost_now - seen.cost) / new
+            rep.fills.append(
+                Fill(m.inst, m.order_side, new, price, st.fee_usd - seen.fee, st.order_id)
+            )
+            seen.qty, seen.cost, seen.fee = st.filled, cost_now, st.fee_usd
+            carry.qty += new
+        if not hedge or carry.qty <= 1e-12:
             return True
-        cost_now = st.filled * (st.avg_price or 0.0)
-        price = (cost_now - seen.cost) / new
-        rep.fills.append(Fill(m.inst, m.order_side, new, price, st.fee_usd - seen.fee, st.order_id))
-        seen.qty, seen.cost, seen.fee = st.filled, cost_now, st.fee_usd
-        want = new + carry.qty
+        want = carry.qty
         left = self._hedge(h, want, rep)
         rep.hedged_qty += want - left
-        carry.qty = 0.0
-        if self.venues[h.inst.venue].round_qty(h.inst, left) > 0:  # a full lot was refused
-            self._unwind(m, left, rep, "hedge failed")
-            return False
-        carry.qty = left  # sub-lot remainder: fold into the next hedge
-        return True
+        carry.qty = left
+        touch = self._quotes([h])[0].mid if left > 1e-12 else 0.0
+        return not (left > 1e-12 and self._sendable(h, left, touch) > 0)
 
     def _moved_away(self, m: _LegPlan, our_price: float) -> bool:
         q = self._quotes([m])[0]
         best = q.bid if m.order_side == "buy" else q.ask
         drift = (best - our_price) if m.order_side == "buy" else (our_price - best)
         return drift / our_price * 1e4 > self.p.maker_requote_bps
+
+    def _unwind_excess(
+        self, legs: list[_LegPlan], rep: ExecutionReport, price: float, reason: str
+    ) -> None:
+        """Trade back whatever one leg did beyond the other, on the leg that did more."""
+        done = []
+        for leg in legs:
+            fwd = sum(
+                f.qty
+                for f in rep.fills
+                if f.instrument == leg.inst and f.order_side == leg.order_side
+            )
+            back = sum(
+                f.qty
+                for f in rep.fills
+                if f.instrument == leg.inst and f.order_side != leg.order_side
+            )
+            done.append(fwd - back)
+        big = 0 if done[0] >= done[1] else 1
+        excess = done[big] - done[1 - big]
+        if excess * price > self.p.residual_tolerance_usd:
+            self._unwind(legs[big], excess, rep, reason)
 
     def _unwind(
         self, leg: _LegPlan, qty: float, rep: ExecutionReport, reason: str = "hedge failed"
@@ -351,18 +422,18 @@ class PairExecutor:
             "sell" if leg.order_side == "buy" else "buy",
             leg.inst.is_perp and not leg.reduce_only,
         )
-        venue = self.venues[leg.inst.venue]
-        left = venue.round_qty(leg.inst, qty)
+        left = qty
         for attempt in range(self.p.hedge_retries):
-            if left <= 0:
-                break
             touch, _ = self._quotes([back])[0].touch(back.order_side)
-            f = self._ioc(back, left, touch, self.p.hedge_slippage_bps * (attempt + 2))
+            lot = self._sendable(back, left, touch)
+            if lot <= 0:
+                break
+            f = self._ioc(back, lot, touch, self.p.hedge_slippage_bps * (attempt + 2))
             if f.qty > 0:
                 rep.fills.append(f)
-                left = venue.round_qty(leg.inst, left - f.qty)
+                left -= f.qty
         msg = f"{reason}: unwound {qty - left:.6g} of {leg.inst.key}"
-        if left > 0:
+        if left * qty > 0 and self.venues[leg.inst.venue].round_qty(leg.inst, left) > 0:
             msg += f", {left:.6g} STILL OPEN"
         log.warning(msg)
         rep.messages.append(msg)

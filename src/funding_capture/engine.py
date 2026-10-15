@@ -102,6 +102,8 @@ class Engine:
         self.entries_halted: str | None = None
         self._perp_positions: dict[str, PerpPositionInfo] = {}
         self._cooldown_until: dict[str, int] = {}  # instrument key -> ms
+        self._venue_blocked_until: dict[str, int] = {}  # venue -> ms (account margin trouble)
+        self._margin_low: set[str] = set()  # venues at/below the margin warning level
         # (position id, leg key) -> (rate, settlement ms) for venues without funding history
         self._est_pending: dict[tuple[str, str], tuple[float, int]] = {}
         self._funding_checked_ms = 0
@@ -112,7 +114,10 @@ class Engine:
     def bootstrap(self, load_state: bool = True) -> None:
         inc, exc = set(self.cfg.include_assets), set(self.cfg.exclude_assets)
         everything: list[Instrument] = []
-        for venue in self.venues.values():
+        for name, venue in self.venues.items():
+            if not getattr(venue, "can_trade", True):
+                log.warning("%s: fills cannot be confirmed through its API; not trading it", name)
+                continue
             for inst in venue.load_instruments():
                 if (inc and inst.asset not in inc) or inst.asset in exc:
                     continue
@@ -234,7 +239,7 @@ class Engine:
             key = (pos.id, inst.key)
             pending = self._est_pending.get(key)
             done = pos.funding_cursor_ms.get(inst.key, 0)
-            if pending and now >= pending[1] > done:
+            if pending and now >= pending[1] > max(done, pos.opened_ms):
                 mark = self._mark(inst) or pos.short_entry
                 pos.funding_usd += -sign * pending[0] * pos.qty * mark
                 pos.funding_cursor_ms[inst.key] = pending[1]
@@ -304,19 +309,25 @@ class Engine:
             alerts.extend(
                 check_position(pos, self._leg_view(c.long), self._leg_view(c.short), self.limits)
             )
-        alerts.extend(self._account_margin_alerts(stale))
+        alerts.extend(self._account_margin_alerts(stale, now))
         return alerts
 
-    def _account_margin_alerts(self, stale: list[str]) -> list[RiskAlert]:
+    def _account_margin_alerts(self, stale: list[str], now: int) -> list[RiskAlert]:
         """Venues that report margin per account (Coinbase US futures) rather than a
-        liquidation price per position: act on the account-wide buffer."""
+        liquidation price per position: act on the account-wide buffer, and stop opening
+        anything new on an account that is short of margin."""
         alerts: list[RiskAlert] = []
+        self._margin_low.clear()
         held = {v for p in self.positions.values() for v in p.candidate.venues}
         for name in held - set(stale):
             buf = self.venues[name].margin_buffer()
             if buf is None:
                 continue
+            if buf < self.limits.warn_liq_distance:
+                self._margin_low.add(name)
             if buf < self.limits.min_liq_distance:
+                until = now + int(self.cfg.risk_cooldown_minutes * 60_000)
+                self._venue_blocked_until[name] = until
                 action, msg = Action.CLOSE, f"{name} account {buf:.1%} from liquidation"
             elif buf < self.limits.warn_liq_distance:
                 action, msg = Action.WARN, f"{name} account {buf:.1%} from liquidation; add margin"
@@ -404,8 +415,9 @@ class Engine:
         c = pos.candidate
         try:
             ex = self.executor.close(c, pos.qty, urgent=urgent)
-        except Exception as exc:
-            log.error("close %s failed: %s", pos.id, exc)
+        except Exception as exc:  # the executor reports errors; this is a last resort
+            self.entries_halted = f"close of {pos.id} raised: {exc}"
+            log.critical("close %s raised; exposure unknown, entries halted: %s", pos.id, exc)
             pos.notes.append(f"close failed: {exc}")
             return
         sold = ex.qty(c.long, "sell")
@@ -420,9 +432,10 @@ class Engine:
             )
         for m in ex.messages:
             pos.notes.append(m)
-        if ex.has_residual:
-            self.entries_halted = f"unhedged residual after closing {pos.id}"
-            log.critical("%s: residual exposure %s", pos.id, ex.residual)
+            log.warning("%s close: %s", pos.id, m)
+        if ex.has_residual or ex.unsafe:
+            self.entries_halted = f"unhedged residual or execution error closing {pos.id}"
+            log.critical("%s: residual %s, messages %s", pos.id, ex.residual, ex.messages)
         if done >= pos.qty * 0.999:
             self._collect_funding(pos)
             pos.closed_ms = now
@@ -532,8 +545,8 @@ class Engine:
             key=lambda s: -s.net_apr_on_capital,
         )
         for s in ranked:
-            if len(self.positions) >= cfg.max_positions:
-                break
+            if len(self.positions) >= cfg.max_positions or self.entries_halted:
+                break  # an execution in this loop may have just halted entries
             c = s.candidate
             if per_asset.get(c.asset, 0) >= cfg.max_positions_per_asset:
                 continue
@@ -541,6 +554,10 @@ class Engine:
                 continue
             if max(self._cooldown_until.get(i.key, 0) for i in (c.long, c.short)) > now:
                 continue
+            if any(
+                v in self._margin_low or self._venue_blocked_until.get(v, 0) > now for v in c.venues
+            ):
+                continue  # that account is short of margin: add none, let it recover
             if not self.tradeable(c, now):
                 continue
             if self._imminent_funding(c, now) < 0:
@@ -567,11 +584,10 @@ class Engine:
             return False
         if self._stale(c.long.venue, now) or self._stale(c.short.venue, now):
             return False
-        for q in (ql, qs):
+        for q, maker in zip((ql, qs), self.costs.maker_legs(c), strict=True):
             if (q.volume_usd_24h or 0.0) < self.cfg.min_volume_usd:
                 return False
-            # a leg worked with post-only orders joins the bid/ask instead of paying the spread
-            maker = q.instrument.venue in self.costs.maker_venues
+            # only the leg worked with post-only orders joins the bid/ask; the other pays it
             if q.spread_bps > self.cfg.max_spread_bps * (4 if maker else 1):
                 return False
         div = price_divergence(ql.mid, qs.mid)
@@ -581,12 +597,15 @@ class Engine:
         c = s.candidate
         try:
             ex = self.executor.open(c, notional)
-        except Exception as exc:
-            log.error("open %s failed: %s", c.key, exc)
+        except Exception as exc:  # the executor reports errors; this is a last resort
+            self.entries_halted = f"open of {c.key} raised: {exc}"
+            log.critical("open %s raised; exposure unknown, entries halted: %s", c.key, exc)
             return None
-        if ex.has_residual:
-            self.entries_halted = f"unhedged residual opening {c.key}"
-            log.critical("residual exposure after open: %s %s", ex.residual, ex.messages)
+        for m in ex.messages:
+            log.warning("open %s: %s", c.key, m)
+        if ex.has_residual or ex.unsafe:
+            self.entries_halted = f"unhedged residual or execution error opening {c.key}"
+            log.critical("after open %s: residual %s, messages %s", c.key, ex.residual, ex.messages)
         long_px, short_px = ex.avg_price(c.long, "buy"), ex.avg_price(c.short, "sell")
         qty = min(
             ex.qty(c.long, "buy") - ex.qty(c.long, "sell"),

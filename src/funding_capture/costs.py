@@ -26,6 +26,14 @@ class VenueFees:
             return self.spot_taker if taker else self.spot_maker
         return self.perp_taker if taker else self.perp_maker
 
+    def fill_fee_usd(self, inst: Instrument, qty: float, price: float, taker: bool) -> float:
+        """Fee for one fill, including the per-contract minimum on perps."""
+        fee = qty * price * self.fee(inst.kind, taker)
+        if inst.is_perp and self.perp_min_fee_per_contract:
+            contracts = qty / (inst.contract_size * inst.multiplier)
+            fee = max(fee, contracts * self.perp_min_fee_per_contract)
+        return fee
+
 
 # Base-tier (no VIP, no token discount) schedules. Verify before trusting.
 DEFAULT_FEES: dict[str, VenueFees] = {

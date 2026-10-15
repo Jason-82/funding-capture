@@ -56,8 +56,34 @@ def _build(cls, data: dict | None, section: str, **extra):
     return cls(**{**data, **extra})
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """safe_load that rejects duplicate keys (YAML would silently keep the last one,
+    e.g. a pasted second `portfolio:` block replacing the first)."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ValueError(f"duplicate key '{key}' at line {key_node.start_mark.line + 1}")
+            seen.add(key)
+        return super().construct_mapping(node, deep)
+
+
+def _check_fees(name: str, fees: VenueFees) -> None:
+    for f in dataclasses.fields(VenueFees):
+        v = getattr(fees, f.name)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError(f"fees.{name}.{f.name}: {v!r} is not a number (use 0.004, not 0.4%)")
+        limit = 10.0 if f.name == "perp_min_fee_per_contract" else 0.05
+        if not 0 <= v < limit:
+            raise ValueError(
+                f"fees.{name}.{f.name} = {v}: out of range; fees are fractions (0.004 = 0.40%)"
+            )
+
+
 def load_settings(path: str | Path | None) -> Settings:
-    raw = yaml.safe_load(Path(path).read_text()) if path else {}
+    raw = yaml.load(Path(path).read_text(), Loader=_UniqueKeyLoader) if path else {}
     raw = raw or {}
     known = {f.name for f in dataclasses.fields(Settings)} | {"fees"}
     unknown = set(raw) - known
@@ -72,7 +98,11 @@ def load_settings(path: str | Path | None) -> Settings:
     fees = dict(DEFAULT_FEES)
     for name, f in (raw.get("fees") or {}).items():
         base = fees.get(name, VenueFees())
-        fees[name] = dataclasses.replace(base, **f)
+        unknown = set(f or {}) - {x.name for x in dataclasses.fields(VenueFees)}
+        if unknown:
+            raise ValueError(f"[fees.{name}] unknown keys: {sorted(unknown)}")
+        fees[name] = dataclasses.replace(base, **(f or {}))
+        _check_fees(name, fees[name])
     costs = _build(CostModel, raw.get("costs"), "costs", fees=fees)
 
     strat_raw = dict(raw.get("strategy") or {})

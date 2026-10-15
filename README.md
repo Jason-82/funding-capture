@@ -58,7 +58,8 @@ fcap -c config.yaml markets --venue coinbase --kind perp
 fcap -c config.yaml live --i-understand-this-trades-real-money
 ```
 
-Paper and live keep separate state in `state/paper/` and `state/live/`. Kill switches
+Paper and live keep separate state in `state/paper/` and `state/live/` (older versions
+used `state/engine.json`; the engine refuses to start until you move that file). Kill switches
 while the engine runs: `touch state/<mode>/STOP` blocks new entries;
 `touch state/<mode>/FLATTEN` closes every pair and stops opening new ones.
 

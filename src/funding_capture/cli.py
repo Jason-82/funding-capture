@@ -114,8 +114,9 @@ def _check_venue(venue, has_creds: bool, step) -> None:
             "your spot fee",
             lambda: venue.ex.fetch_trading_fee(spots[0].symbol),
             lambda r: (
-                f"maker {float(r.get('maker') or 0):.4%} / taker {float(r.get('taker') or 0):.4%}"
-                " (copy into config `fees:`)"
+                f"spot_maker: {float(r.get('maker') or 0):.4f}  "
+                f"spot_taker: {float(r.get('taker') or 0):.4f}"
+                f"  (fractions; paste under fees: {venue.name}:)"
             ),
         )
     if perps:
@@ -148,8 +149,15 @@ def cmd_check(args, settings: Settings) -> None:
             print(f"  FAIL  {label}: {type(exc).__name__}: {str(exc)[:300]}")
             return None
 
-    for name, venue in _data_venues(settings, auth=True).items():
-        creds = credentials_from_env(name)
+    for vs in settings.venues:
+        name = vs.name
+        try:
+            creds = credentials_from_env(name)
+            venue = _data_venues(settings, [name], auth=True)[name]
+        except Exception as exc:
+            failures += 1
+            print(f"{name}\n  FAIL  credentials: {exc}")
+            continue
         print(f"{name}  (ccxt id: {venue.ex.id}; credentials: {sorted(creds) or 'none'})")
         _check_venue(venue, bool(creds), step)
     if failures:
@@ -225,6 +233,13 @@ def cmd_fetch(args, settings: Settings) -> None:
         )
         added = download_funding_history(venue, store, perps, since, _ms(args.until))
         log.info("%s: %d markets, %d new settlements", name, len(added), sum(added.values()))
+    for name, perps in venue_perps.items():  # keep markets with history from record/import
+        have = {p.key for p in perps}
+        perps.extend(
+            i
+            for i in store.load_instruments(name)
+            if i.kind.value == "perp" and i.key not in have and store.load_funding(i)
+        )
     save_universe(store, venue_instruments, venue_perps)
 
 
@@ -359,6 +374,16 @@ def _state_dir(settings: Settings, live: bool) -> str:
 
 def _engine(settings: Settings, live: bool):
     import dataclasses
+    from pathlib import Path
+
+    old = Path(settings.portfolio.state_dir) / "engine.json"
+    new = Path(_state_dir(settings, live)) / "engine.json"
+    if old.exists() and not new.exists():
+        sys.exit(
+            f"found {old} from an older version, which kept paper and live state together. "
+            f"Move it to {new} if it belongs to {'live' if live else 'paper'} trading (or "
+            "delete it if it was paper), then start again."
+        )
 
     from .data import HistoryStore
     from .engine import Engine

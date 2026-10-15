@@ -211,7 +211,7 @@ $ touch state/paper/FLATTEN     # close everything now and stop opening
 
 * realised funding per pair vs. what `scan` expected when it opened
 * fees per round trip vs. config
-* `grep "timed out" logs/paper.log`: how often the spot maker order didn't fill in time.
+* `grep -c "timed out" logs/paper.log`: how often the spot maker order didn't fill in time.
   Paper fills are optimistic (no queue), so real maker fills will be fewer and slower.
 * any `risk CLOSE` or `CRITICAL` lines, and why
 
@@ -263,10 +263,16 @@ $ chmod 600 .env
 $ fcap -c config.yaml check
 ```
 
-Now each venue should also show `ok balance: …`, `ok your spot fee: maker x% / taker y%`
-(**copy those numbers into `fees:` in config.yaml**) and, for Coinbase,
-`ok positions: none` and a `margin buffer` line. Re-run `scan` afterwards, because your
-real fees change which pairs pass.
+Now each venue should also show `ok balance: …` and a line like
+
+```
+  ok    your spot fee: spot_maker: 0.0040  spot_taker: 0.0080  (fractions; paste under fees: kraken:)
+```
+
+**Paste those two values into `config.yaml`** under `fees:` → that venue. They are
+fractions: 0.0040 means 0.40%. The config refuses percent-style values like `0.4` or
+`0.4%`. Coinbase should also show `ok positions: none` and a `margin buffer` line.
+Re-run `scan` afterwards, because your real fees change which pairs pass.
 
 ## 9. Go live, small
 
@@ -279,13 +285,15 @@ real fees change which pairs pass.
   cash on Coinbase: overnight margin on short alt perps is 30–95% of notional, and it
   rises at the 5 pm ET switch from intraday to overnight rates.
 
-**First live run: one contract.** In `config.yaml`:
+**First live run: one contract.** In `config.yaml`, **edit the existing lines** (don't
+paste a second `portfolio:` block; the config refuses duplicate sections):
 
 ```yaml
-mode: live
+mode: live                       # was: paper
 portfolio:
-  max_positions: 1
-  max_position_usd: 600          # pairs whose single contract is worth more are skipped
+  ...
+  max_positions: 1               # was: 4
+  max_position_usd: 600          # was: 1000; pairs whose single contract is worth more are skipped
 ```
 
 (`fcap -c config.yaml markets --venue coinbase --kind perp` shows `$/contract`; it ranges
@@ -316,7 +324,10 @@ bot stops. Only use it if the bot is the only thing trading that account.)
 ## 10. Daily operations checklist
 
 * `fcap -c config.yaml status --live`: anything stuck, partially closed, or unexpectedly old?
-* `grep -E "CRITICAL|risk CLOSE|FAIL|HALTED" logs/live.log`: investigate every hit.
+* `grep -iE "critical|error|risk close|halted|still open" logs/live.log`: investigate
+  every hit. `ENTRIES HALTED` in `status` means the bot found something it can't resolve
+  alone (usually a one-sided leftover after an order problem). Fix it on the exchange,
+  then restart the bot.
 * Coinbase margin: `fcap -c config.yaml check` prints the account's distance to
   liquidation. The bot warns at 35% and closes pairs at 20%; add USD well before that.
 * Venue announcements: new/delisted perps, maintenance (Coinbase futures pause Fridays
@@ -336,13 +347,15 @@ CPA before you scale up.
 | Symptom | Likely cause / fix |
 |---|---|
 | `FAIL markets: NetworkError` | internet/VPN/firewall, or the venue is down; retry |
-| `FAIL balance: AuthenticationError` | wrong key/secret, missing permission, IP not allowlisted, or (Coinbase) PEM not found: check `COINBASE_SECRET_FILE` |
+| `FAIL credentials: COINBASE_SECRET_FILE: cannot read …` | the PEM path in `.env` is wrong |
+| `FAIL balance: AuthenticationError` | wrong key/secret, missing permission, or IP not allowlisted |
+| `found state/engine.json from an older version` | move it to `state/paper/` or `state/live/` as the message says |
 | Kraken `EAPI:Invalid nonce` | key used by another tool, or clock off: use a fresh key, sync your clock |
 | Coinbase order `403` / "onboarded users" | finish futures onboarding in the Coinbase app |
 | `coinbase rejected sor_limit_ioc …; retrying as FOK` | expected once if Coinbase doesn't accept IOC on futures; the bot switches automatically |
 | `scan` shows nothing with `*` | thresholds too strict for current funding, or fees too high: try `--all`, check `fees:` |
 | `ENTRIES HALTED: stale market data` | a venue stopped answering; clears when data returns |
-| `ENTRIES HALTED: unhedged residual …` | an execution left a one-sided remainder: fix it by hand on the exchange, then restart |
+| `ENTRIES HALTED: unhedged residual or execution error …` | an order problem left a one-sided remainder, or the bot couldn't confirm an order was cancelled: check open orders and balances on both exchanges, fix by hand, then restart |
 | frequent `maker order … timed out` | spot leg not filling: raise `execution.maker_timeout_s`, or accept that coin is too thin |
 
 ## Command reference
@@ -353,7 +366,8 @@ fcap -c config.yaml markets --venue V [--kind perp|spot]   symbols and contract 
 fcap -c config.yaml scan [--top N] [--all]      live opportunities
 fcap -c config.yaml record [--interval S]       log funding forward (Coinbase has no history API)
 fcap -c config.yaml import-funding --venue V --symbol S --file F [--percent]
-fcap -c config.yaml fetch [--days N] [--venues a,b]   download history (venues with an API)
+fcap -c config.yaml fetch [--days N] [--venues a,b]   download history (venues with a history
+                                                API; not needed for Coinbase perps)
 fcap -c config.yaml backtest [--start YYYY-MM-DD] [--end …] [--trades file.csv]
 fcap -c config.yaml sweep [--split 0.5] [--top N]
 fcap -c config.yaml paper
