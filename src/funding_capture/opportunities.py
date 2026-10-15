@@ -110,14 +110,16 @@ def score(
     short_fcst: float,
     costs: CostModel,
     params: StrategyParams,
+    long_price: float | None = None,
+    short_price: float | None = None,
 ) -> Scored:
-    """Score with per-leg hourly rates (spot legs: pass 0)."""
+    """Score with per-leg hourly rates (spot legs: pass 0). Prices enable per-contract fees."""
     borrow = costs.borrow_hourly(cand)
     return Scored(
         candidate=cand,
         carry_now_hourly=candidate_carry_hourly(cand, long_now, short_now, borrow),
         carry_fcst_hourly=candidate_carry_hourly(cand, long_fcst, short_fcst, borrow),
-        round_trip_cost=costs.round_trip_cost(cand),
+        round_trip_cost=costs.round_trip_cost(cand, long_price, short_price),
         capital_per_notional=costs.capital_per_notional(cand),
         horizon_hours=params.horizon_hours,
     )

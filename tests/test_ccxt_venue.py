@@ -299,3 +299,63 @@ def test_lighter_rates_are_normalised_to_hourly():
     rows = v.fetch_funding_history(eth, 0, until_ms=3_600_000 * 10)
     assert calls[0]["market_id"] == 0 and calls[0]["resolution"] == "1h"
     assert rows == [(3_600_000, pytest.approx(0.000012)), (7_200_000, pytest.approx(-0.00003))]
+
+
+def _kraken():
+    ex = ccxt.kraken()
+    a = _market("BTC/USD", "BTC", "spot", amount_step=0.0001)
+    a.update(quote="USD", info={"status": "online"})
+    b = _market("WIF/USD", "WIF", "spot", amount_step=0.01)  # no status -> ccxt: inactive
+    b.update(quote="USD", active=False, info={})
+    c = _market("OLD/USD", "OLD", "spot")
+    c.update(quote="USD", active=False, info={"status": "delisted"})
+    ex.set_markets([a, b, c])
+    return CcxtVenue("kraken", exchange=ex, quotes=("USD", "USDC"), kinds=("spot",))
+
+
+def test_kraken_keeps_pairs_without_status_and_fetches_all_tickers():
+    v = _kraken()
+    assert {i.asset for i in v.load_instruments()} == {"BTC", "WIF"}
+    calls = []
+
+    def tickers(symbols=None):
+        calls.append(symbols)
+        return {"WIF/USD": {"bid": 1.0, "ask": 1.01, "quoteVolume": 3e6}}
+
+    v.ex.fetch_tickers = tickers
+    wif = next(i for i in v.load_instruments() if i.asset == "WIF")
+    assert v.fetch_quotes([wif])[wif.key].ask == 1.01
+    assert calls == [None]  # asking by symbol would silently drop WIF
+
+
+def test_kraken_orders_take_fee_in_usd_and_balance_counts_earn():
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    sent = {}
+
+    def create_order(symbol, type_, side, amount, price, params):
+        sent.update(params)
+        return {"id": "k1", "status": "closed", "filled": amount, "average": price}
+
+    v.ex.create_order = create_order
+    v.place_ioc(btc, "sell", 0.01, 60_000)
+    assert sent["oflags"] == "fciq" and sent["timeInForce"] == "IOC"
+    sent.clear()
+    v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert sent["oflags"] == "fciq" and sent["postOnly"] is True
+    v.ex.fetch_balance = lambda: {"total": {"BTC": 0.5, "BTC.F": 0.25, "USD": 10}}
+    assert v.fetch_spot_balance(btc) == pytest.approx(0.75)
+
+
+def test_per_contract_minimum_fee():
+    from funding_capture.costs import CostModel, VenueFees
+    from funding_capture.models import Instrument
+
+    shib = Instrument("coinbase", "SHP-20DEC30-CDE", "SHIB", Kind.PERP, "USD", 1000, 10000)
+    costs = CostModel(
+        fees={"coinbase": VenueFees(perp_taker=0.0002, perp_min_fee_per_contract=0.20)},
+        slippage_bps=0,
+    )
+    # one contract = 10M SHIB; at $0.00000553 that is $55.30, so $0.20 is 36 bps
+    assert costs.leg_cost(shib, price=0.00553 / 1000) == pytest.approx(0.20 / 55.3)
+    assert costs.leg_cost(shib) == pytest.approx(0.0002)  # no price: percentage only

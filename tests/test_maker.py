@@ -162,3 +162,11 @@ def test_partial_maker_fills_below_hedge_lot_are_carried_not_lost():
     assert rep.hedged_qty == pytest.approx(1.0)
     assert rep.complete and not rep.has_residual
     assert vh.state.books[p.key].qty == pytest.approx(-1.0)
+
+
+def test_cost_model_works_only_one_leg_passively():
+    both = Candidate(Construction.SPOT_PERP, "BTC", long=spot("coinbase"), short=perp("coinbase"))
+    fees = {"coinbase": VenueFees(0.009, 0.005, 0.0003, 0.0002)}
+    costs = CostModel(fees=fees, slippage_bps=0, maker_venues=("coinbase",))
+    assert costs.maker_legs(both) == (True, False)  # spot rests, perp takes
+    assert costs.round_trip_cost(both) == pytest.approx(2 * (0.005 + 0.0003))

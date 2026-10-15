@@ -95,6 +95,10 @@ class PaperVenue(Venue):
     def fetch_touch(self, inst: Instrument) -> Quote:
         return self.data.fetch_touch(inst)
 
+    @property
+    def reports_funding(self) -> bool:  # type: ignore[override]
+        return True  # the simulator settles funding itself (see tick)
+
     def fetch_volumes(self, instruments) -> dict[str, float]:
         return self.data.fetch_volumes(instruments)
 

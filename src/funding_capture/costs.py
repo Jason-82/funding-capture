@@ -17,6 +17,9 @@ class VenueFees:
     spot_maker: float = 0.0010
     perp_taker: float = 0.0006
     perp_maker: float = 0.0002
+    # US futures charge per contract: each perp fill costs at least this much (USD) per
+    # contract. Applied when a price is known (scanner/engine); the backtest ignores it.
+    perp_min_fee_per_contract: float = 0.0
 
     def fee(self, kind: Kind, taker: bool = True) -> float:
         if kind is Kind.SPOT:
@@ -37,6 +40,21 @@ DEFAULT_FEES: dict[str, VenueFees] = {
         spot_taker=0.0007, spot_maker=0.0004, perp_taker=0.00045, perp_maker=0.00015
     ),
     "dydx": VenueFees(spot_taker=0.0, spot_maker=0.0, perp_taker=0.0005, perp_maker=0.0001),
+    "lighter": VenueFees(spot_taker=0.0, spot_maker=0.0, perp_taker=0.0, perp_maker=0.0),
+    # US venues. Coinbase Advanced "Intro" tier since 2026-09-16 (0.50% / 0.90%). Its US
+    # perpetual-style futures charge per contract: $0.10 exchange fee plus an unpublished
+    # FCM commission, modelled as max(0.02%, $0.20) per contract per side until you
+    # confirm yours with an order preview.
+    "coinbase": VenueFees(
+        spot_taker=0.0090,
+        spot_maker=0.0050,
+        perp_taker=0.0002,
+        perp_maker=0.0002,
+        perp_min_fee_per_contract=0.20,
+    ),
+    # Kraken Pro Tier 1 after the July 2026 schedule change (unconfirmed; earlier it was
+    # 0.25% / 0.40%). `fcap check` prints your real rate once API keys are set.
+    "kraken": VenueFees(spot_taker=0.0080, spot_maker=0.0040, perp_taker=0.0005, perp_maker=0.0002),
 }
 
 
@@ -55,16 +73,36 @@ class CostModel:
     # (portfolio / unified margin). 0 = separate wallets, 1 = fully cross-margined.
     unified_margin_credit: float = 0.0
 
-    def leg_cost(self, inst: Instrument) -> float:
-        """Cost fraction of one fill (one side, one leg)."""
-        fees = self.fees.get(inst.venue, self.default_fees)
-        if inst.venue in self.maker_venues:
-            return fees.fee(inst.kind, taker=False)
-        return fees.fee(inst.kind, self.taker) + self.slippage_bps / 1e4
+    def maker_legs(self, cand: Candidate) -> tuple[bool, bool]:
+        """Which legs the executor works passively: legs on maker venues, but only one per
+        pair (the spot leg when both qualify), mirroring ``PairExecutor._maker_leg``."""
+        ml, ms = cand.long.venue in self.maker_venues, cand.short.venue in self.maker_venues
+        if ml and ms:
+            ml = cand.long.kind is Kind.SPOT
+            ms = not ml
+        return ml, ms
 
-    def round_trip_cost(self, cand: Candidate) -> float:
+    def leg_cost(
+        self, inst: Instrument, price: float | None = None, maker: bool | None = None
+    ) -> float:
+        """Cost fraction of one fill (one side, one leg). ``price``: USD per asset unit."""
+        fees = self.fees.get(inst.venue, self.default_fees)
+        if maker is None:
+            maker = inst.venue in self.maker_venues
+        fee = fees.fee(inst.kind, taker=not maker and self.taker)
+        if inst.is_perp and fees.perp_min_fee_per_contract and price:
+            contract_value = inst.contract_size * inst.multiplier * price
+            fee = max(fee, fees.perp_min_fee_per_contract / contract_value)
+        return fee if maker else fee + self.slippage_bps / 1e4
+
+    def round_trip_cost(
+        self, cand: Candidate, long_price: float | None = None, short_price: float | None = None
+    ) -> float:
         """Fraction of notional spent to open *and* close both legs."""
-        return 2 * (self.leg_cost(cand.long) + self.leg_cost(cand.short))
+        ml, ms = self.maker_legs(cand)
+        return 2 * (
+            self.leg_cost(cand.long, long_price, ml) + self.leg_cost(cand.short, short_price, ms)
+        )
 
     def capital_per_notional(self, cand: Candidate) -> float:
         """USD of capital tied up per USD of hedged notional."""

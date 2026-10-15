@@ -106,3 +106,20 @@ def test_status_reads_paper_state_separately_from_live(tmp_path, capsys):
     assert "open pairs: 1" in out and "P1" in out and "funding=$1.50" in out
     with pytest.raises(SystemExit, match="fcap live"):
         main(["-c", str(cfg), "status", "--live"])
+
+
+def test_read_funding_csv_variants(tmp_path):
+    from funding_capture.data import read_funding_csv
+
+    a = tmp_path / "a.csv"
+    a.write_text(
+        "Funding Time,Funding Rate\n2026-10-01T01:00:00Z,0.0021%\n2026-10-01T00:00:00Z,-0.001%\n"
+    )
+    rows = read_funding_csv(a)
+    assert rows == [
+        (1_790_812_800_000, pytest.approx(-0.00001)),
+        (1_790_816_400_000, pytest.approx(0.000021)),
+    ]
+    b = tmp_path / "b.csv"
+    b.write_text("ts,rate\n1790812800,0.00002\n")
+    assert read_funding_csv(b) == [(1_790_812_800_000, pytest.approx(0.00002))]

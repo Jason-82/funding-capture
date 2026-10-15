@@ -10,6 +10,9 @@ from ..models import FundingSnapshot, Instrument, OrderState, PerpPositionInfo, 
 
 class Venue(ABC):
     name: str
+    # False when the venue has no API for funding actually paid; the engine then estimates
+    # it from observed rates and positions.
+    reports_funding: bool = True
 
     # -- market data -----------------------------------------------------------------
     @abstractmethod
@@ -92,6 +95,14 @@ class Venue(ABC):
 
     def tick(self, now_ms: int) -> None:  # noqa: B027 - optional hook, no-op by default
         """Hook for simulated venues to advance time (settle funding, etc.)."""
+
+    def heartbeat(self) -> None:  # noqa: B027 - optional hook, no-op by default
+        """Called every live loop; e.g. refreshes a cancel-all-orders dead-man's switch."""
+
+    def margin_buffer(self) -> float | None:
+        """Account-wide distance to liquidation as a fraction, for venues that only report
+        margin per account (no per-position liquidation price). None if unknown."""
+        return None
 
 
 def floor_to_step(qty: float, step: float | None) -> float:

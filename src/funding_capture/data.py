@@ -160,3 +160,40 @@ def save_universe(
     for venue, insts in venue_instruments.items():
         spots = [i for i in insts if i.kind is Kind.SPOT and i.asset in perp_assets]
         store.save_instruments(venue, venue_perps.get(venue, []) + spots)
+
+
+def read_funding_csv(
+    path: str | Path,
+    time_col: str | None = None,
+    rate_col: str | None = None,
+    percent: bool = False,
+) -> list[tuple[int, float]]:
+    """Read a funding-rate CSV exported from an exchange website into [(ts_ms, rate)].
+
+    Columns are guessed from headers containing "time"/"date" and "rate" unless given.
+    Times may be ISO strings or epoch seconds/milliseconds. ``percent`` divides by 100.
+    """
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+
+    def pick(given: str | None, words: tuple[str, ...]) -> str:
+        if given:
+            return given
+        for lc, c in cols.items():
+            if any(w in lc for w in words):
+                return c
+        raise ValueError(f"cannot find a {'/'.join(words)} column in {list(df.columns)}")
+
+    tcol, rcol = pick(time_col, ("time", "date", "ts")), pick(rate_col, ("rate",))
+    t = df[tcol]
+    if pd.api.types.is_numeric_dtype(t):
+        unit = "ms" if t.abs().max() > 1e11 else "s"
+        ts = pd.to_datetime(t, unit=unit, utc=True)
+    else:
+        ts = pd.to_datetime(t, utc=True)
+    rate = pd.to_numeric(df[rcol].astype(str).str.rstrip("%"), errors="coerce")
+    if percent or df[rcol].astype(str).str.endswith("%").any():
+        rate = rate / 100
+    ms = (ts - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(milliseconds=1)  # any resolution
+    out = pd.DataFrame({"ts": ms, "rate": rate}).dropna()
+    return sorted((int(a), float(b)) for a, b in zip(out["ts"], out["rate"], strict=True))

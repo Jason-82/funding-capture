@@ -26,6 +26,9 @@ class VenueSettings:
     kinds: tuple[str, ...] = ("spot", "perp")  # e.g. [spot] to use a venue only for spot legs
     options: dict = field(default_factory=dict)  # passed to the ccxt constructor
     paper_leverage: float = 2.0
+    # live only: refresh a cancel-all-orders-after timer of this many seconds every loop,
+    # so resting maker orders die with the bot (it cancels ALL open orders on the account)
+    dead_man_seconds: int = 0
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""Command line: fcap check | scan | fetch | backtest | sweep | paper | live | status."""
+"""Command line: fcap check | scan | fetch | record | backtest | sweep | paper | live | status."""
 
 from __future__ import annotations
 
@@ -44,13 +44,23 @@ def _ms(date: str | None) -> int | None:
 
 def _data_venues(settings: Settings, names: list[str] | None = None, auth: bool = False):
     from .venues.ccxt_venue import CcxtVenue, credentials_from_env
+    from .venues.coinbase import CoinbaseVenue
 
     out = {}
     for vs in settings.venues:
         if names and vs.name not in names:
             continue
         creds = credentials_from_env(vs.name) if auth else None
-        out[vs.name] = CcxtVenue(vs.name, vs.ccxt_id, vs.quotes, creds, vs.options, kinds=vs.kinds)
+        klass = CoinbaseVenue if (vs.ccxt_id or vs.name) == "coinbase" else CcxtVenue
+        out[vs.name] = klass(
+            vs.name,
+            vs.ccxt_id,
+            vs.quotes,
+            creds,
+            vs.options,
+            kinds=vs.kinds,
+            dead_man_seconds=vs.dead_man_seconds if auth else 0,
+        )
     return out
 
 
@@ -98,6 +108,15 @@ def _check_venue(venue, has_creds: bool, step) -> None:
             or "empty"
         ),
     )
+    if spots and venue.ex.has.get("fetchTradingFee"):
+        step(
+            "your spot fee",
+            lambda: venue.ex.fetch_trading_fee(spots[0].symbol),
+            lambda r: (
+                f"maker {float(r.get('maker') or 0):.4%} / taker {float(r.get('taker') or 0):.4%}"
+                " (copy into config `fees:`)"
+            ),
+        )
     if perps:
         step(
             "positions",
@@ -106,6 +125,9 @@ def _check_venue(venue, has_creds: bool, step) -> None:
                 ", ".join(f"{p.instrument.symbol} {p.qty:+.6g}" for p in r.values()) or "none"
             ),
         )
+        buf = venue.margin_buffer()
+        if buf is not None:
+            print(f"  ok    margin buffer: {buf:.1%} from liquidation")
 
 
 def cmd_check(args, settings: Settings) -> None:
@@ -203,6 +225,61 @@ def cmd_fetch(args, settings: Settings) -> None:
         added = download_funding_history(venue, store, perps, since, _ms(args.until))
         log.info("%s: %d markets, %d new settlements", name, len(added), sum(added.values()))
     save_universe(store, venue_instruments, venue_perps)
+
+
+def cmd_record(args, settings: Settings) -> None:
+    """Log published funding forward into the history store (for venues with no history
+    API, e.g. Coinbase US perps). The last reading before each settlement is kept."""
+    import time
+
+    from .data import HistoryStore, save_universe
+    from .models import Kind
+
+    store = HistoryStore(settings.data_dir)
+    venues = _data_venues(settings, args.venues.split(",") if args.venues else None)
+    insts = {n: v.load_instruments() for n, v in venues.items()}
+    perps = {n: [i for i in xs if i.kind is Kind.PERP] for n, xs in insts.items()}
+    save_universe(store, insts, perps)
+    while True:
+        n = 0
+        for name, venue in venues.items():
+            if not perps[name]:
+                continue
+            try:
+                snaps = venue.fetch_funding(perps[name])
+            except Exception as exc:
+                log.warning("%s: funding fetch failed: %s", name, exc)
+                continue
+            for snap in snaps.values():
+                if snap.next_funding_ts:
+                    store.append_funding(snap.instrument, [(int(snap.next_funding_ts), snap.rate)])
+                    n += 1
+        log.info("recorded %d funding readings", n)
+        if args.once:
+            return
+        time.sleep(args.interval)
+
+
+def cmd_import(args, settings: Settings) -> None:
+    from .data import HistoryStore, read_funding_csv, save_universe
+    from .models import Kind
+
+    store = HistoryStore(settings.data_dir)
+    insts = {i.symbol: i for i in store.load_instruments(args.venue)}
+    if args.symbol not in insts:  # first time: learn the venue's markets
+        venue = _data_venues(settings, [args.venue])[args.venue]
+        loaded = venue.load_instruments()
+        save_universe(
+            store, {args.venue: loaded}, {args.venue: [i for i in loaded if i.kind is Kind.PERP]}
+        )
+        insts = {i.symbol: i for i in loaded}
+    if args.symbol not in insts:
+        sys.exit(f"{args.symbol} is not a market on {args.venue}")
+    rows = read_funding_csv(args.file, args.time_col, args.rate_col, args.percent)
+    added = store.append_funding(insts[args.symbol], rows)
+    print(f"{len(rows)} rows read, {added} new settlements stored for {args.venue} {args.symbol}")
+    if rows:
+        print(f"first {rows[0]}, last {rows[-1]}; check that rates look like fractions per hour")
 
 
 def _backtester(args, settings: Settings):
@@ -321,6 +398,21 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--top", type=int, default=25)
     s.add_argument("--all", action="store_true", help="include rows failing liquidity filters")
     s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("record", help="log funding forward (venues without a history API)")
+    s.add_argument("--venues", help="comma list (default: all configured)")
+    s.add_argument("--interval", type=float, default=600, help="seconds between readings")
+    s.add_argument("--once", action="store_true")
+    s.set_defaults(fn=cmd_record)
+
+    s = sub.add_parser("import-funding", help="load a funding-rate CSV from an exchange site")
+    s.add_argument("--venue", required=True)
+    s.add_argument("--symbol", required=True, help="venue symbol, e.g. BIP-20DEC30-CDE")
+    s.add_argument("--file", required=True)
+    s.add_argument("--time-col")
+    s.add_argument("--rate-col")
+    s.add_argument("--percent", action="store_true", help="rates in the file are percents")
+    s.set_defaults(fn=cmd_import)
 
     s = sub.add_parser("fetch", help="download historical funding settlements")
     s.add_argument("--venues", help="comma list (default: all configured)")

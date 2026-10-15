@@ -102,6 +102,8 @@ class Engine:
         self.entries_halted: str | None = None
         self._perp_positions: dict[str, PerpPositionInfo] = {}
         self._cooldown_until: dict[str, int] = {}  # instrument key -> ms
+        # (position id, leg key) -> (rate, settlement ms) for venues without funding history
+        self._est_pending: dict[tuple[str, str], tuple[float, int]] = {}
         self._funding_checked_ms = 0
         self._seq = 0
         self.state_path = Path(config.state_dir) / "engine.json"
@@ -159,6 +161,7 @@ class Engine:
         rep = StepReport()
         for v in self.venues.values():
             v.tick(now)
+            v.heartbeat()
         self.refresh(now)
         self._account(now)
         self._kill_switches(rep, now)
@@ -207,7 +210,7 @@ class Engine:
     def _collect_funding(self, pos: PairPosition) -> None:
         """Add funding paid on the pair's perp legs since the last collection."""
         for inst in (pos.candidate.long, pos.candidate.short):
-            if not inst.is_perp:
+            if not inst.is_perp or not self.venues[inst.venue].reports_funding:
                 continue
             since = pos.funding_cursor_ms.get(inst.key, pos.opened_ms - 1) + 1
             try:
@@ -222,11 +225,31 @@ class Engine:
                         ts, pos.funding_cursor_ms.get(inst.key, 0)
                     )
 
+    def _estimate_funding(self, pos: PairPosition, now: int) -> None:
+        """For venues that can't report funding paid: credit each settlement at the rate last
+        seen before it, on the position's size at mark (the same model as paper trading)."""
+        for inst, sign in ((pos.candidate.long, 1), (pos.candidate.short, -1)):
+            if not inst.is_perp or self.venues[inst.venue].reports_funding:
+                continue
+            key = (pos.id, inst.key)
+            pending = self._est_pending.get(key)
+            done = pos.funding_cursor_ms.get(inst.key, 0)
+            if pending and now >= pending[1] > done:
+                mark = self._mark(inst) or pos.short_entry
+                pos.funding_usd += -sign * pending[0] * pos.qty * mark
+                pos.funding_cursor_ms[inst.key] = pending[1]
+                if "funding estimated from published rates" not in pos.notes:
+                    pos.notes.append("funding estimated from published rates")
+            snap = self.snaps.get(inst.key)
+            if snap is not None and snap.next_funding_ts:
+                self._est_pending[key] = (snap.rate, int(snap.next_funding_ts))
+
     def _account(self, now: int) -> None:
         """Collect realised funding from venues and accrue borrow cost."""
         refresh = now - self._funding_checked_ms >= self.cfg.funding_refresh_minutes * 60_000
         for pos in self.positions.values():
             c = pos.candidate
+            self._estimate_funding(pos, now)
             if refresh:
                 self._collect_funding(pos)
             borrow_h = self.costs.borrow_hourly(c)
@@ -281,6 +304,27 @@ class Engine:
             alerts.extend(
                 check_position(pos, self._leg_view(c.long), self._leg_view(c.short), self.limits)
             )
+        alerts.extend(self._account_margin_alerts(stale))
+        return alerts
+
+    def _account_margin_alerts(self, stale: list[str]) -> list[RiskAlert]:
+        """Venues that report margin per account (Coinbase US futures) rather than a
+        liquidation price per position: act on the account-wide buffer."""
+        alerts: list[RiskAlert] = []
+        held = {v for p in self.positions.values() for v in p.candidate.venues}
+        for name in held - set(stale):
+            buf = self.venues[name].margin_buffer()
+            if buf is None:
+                continue
+            if buf < self.limits.min_liq_distance:
+                action, msg = Action.CLOSE, f"{name} account {buf:.1%} from liquidation"
+            elif buf < self.limits.warn_liq_distance:
+                action, msg = Action.WARN, f"{name} account {buf:.1%} from liquidation; add margin"
+            else:
+                continue
+            for pos in self.positions.values():
+                if name in pos.candidate.venues:
+                    alerts.append(RiskAlert(action, "liquidation", msg, pos.id))
         return alerts
 
     def _handle_alerts(self, rep: StepReport, now: int) -> None:
@@ -326,7 +370,9 @@ class Engine:
     def _score(self, c: Candidate) -> Scored:
         ln, lf = self._leg_rates(c.long)
         sn, sf = self._leg_rates(c.short)
-        return score(c, ln, sn, lf, sf, self.costs, self.strategy)
+        return score(
+            c, ln, sn, lf, sf, self.costs, self.strategy, self._mark(c.long), self._mark(c.short)
+        )
 
     def score_all(self) -> dict[str, Scored]:
         return {c.key: self._score(c) for c in self.candidates}
@@ -561,6 +607,7 @@ class Engine:
             notes=[f"opened at {s.net_apr_on_capital:.1%} expected net APR"] + ex.messages,
         )
         self.positions[pos.id] = pos
+        self._estimate_funding(pos, now)  # note the upcoming settlement for estimating venues
         log.info(
             "OPENED %s %s qty=%.6g notional=$%.0f exp.APR=%.1f%%",
             pos.id,

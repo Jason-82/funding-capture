@@ -54,8 +54,8 @@ class World:
                     q.volume_usd_24h,
                 )
 
-    def new_engine(self):
-        self.va, self.vb = PaperVenue(self.da, FEES), PaperVenue(self.db, FEES)
+    def new_engine(self, venue_cls=PaperVenue):
+        self.va, self.vb = venue_cls(self.da, FEES), venue_cls(self.db, FEES)
         venues = {"a": self.va, "b": self.vb}
         strategy = StrategyParams(
             constructions=(Construction.SPOT_PERP, Construction.PERP_PERP),
@@ -198,3 +198,24 @@ def test_funding_accumulates_once_per_settlement(tmp_path, clock):
             w.touch_quotes()
             w.engine.step()
     assert pos.funding_usd == pytest.approx(2 * 0.0004 * pos.qty * 100.0)
+
+
+class NoFundingHistoryVenue(PaperVenue):
+    """Like Coinbase US futures: trades fine but can't report funding paid."""
+
+    reports_funding = False
+
+
+def test_engine_estimates_funding_when_venue_cannot_report_it(tmp_path, clock):
+    w = World(tmp_path, clock)
+    w.engine = w.new_engine(NoFundingHistoryVenue)
+    w.engine.step()
+    pos = next(iter(w.engine.positions.values()))
+    clock.advance(hours=8, minutes=1)
+    w.set_funding(0.0005, 0.0001, next_ts=T0 + 16 * HOUR)
+    w.touch_quotes()
+    w.engine.step()
+    w.engine.step()  # a second loop must not double count
+    # valued at the leg's mid (100.01) rather than the venue's mark (100.00)
+    assert pos.funding_usd == pytest.approx(0.0004 * pos.qty * 100.01)
+    assert "funding estimated from published rates" in pos.notes

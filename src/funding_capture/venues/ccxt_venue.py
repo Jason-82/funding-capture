@@ -59,11 +59,20 @@ def credentials_from_env(venue: str) -> dict[str, str]:
 
 # Options we always want for some ccxt exchanges (user options override these).
 _DEFAULT_OPTIONS: dict[str, dict] = {
-    # ccxt otherwise approves and attaches its own builder fee: +0.01% per fill.
-    "hyperliquid": {"builderFee": False, "fetchMarkets": {"types": ["spot", "swap"]}},
+    # ccxt otherwise approves and attaches its own builder fee (+0.01% per fill), binds the
+    # account to its referral code, and loads HIP-3 (builder-deployed) markets.
+    "hyperliquid": {
+        "builderFee": False,
+        "refSet": True,
+        "fetchMarkets": {"types": ["spot", "swap"]},
+    },
     # ccxt otherwise attaches a 0.10% integrator fee per fill on non-standard accounts.
     "lighter": {"builderFee": False},
 }
+
+# Extra params on every order. Kraken: take the fee in the quote currency so the coin
+# quantity bought/sold matches the hedge exactly (default for sells is fee-in-coin).
+_ORDER_PARAMS: dict[str, dict] = {"kraken": {"oflags": "fciq"}}
 
 # Venues whose ccxt funding rate is quoted per N hours although they settle hourly.
 # Lighter's /funding-rates normalises every venue to an 8h-equivalent fraction.
@@ -71,6 +80,14 @@ _RATE_QUOTED_PER_HOURS: dict[str, float] = {"lighter": 8.0}
 
 # Up to this many instruments without a usable ticker bid/ask get an order-book quote.
 _BOOK_FALLBACK_MAX = 20
+
+
+def ex_id_of(exchange) -> str:
+    return getattr(exchange, "id", "")
+
+
+def merged_opt(exchange, key: str):
+    return (getattr(exchange, "options", None) or {}).get(key)
 
 
 class CcxtVenue(Venue):
@@ -84,6 +101,7 @@ class CcxtVenue(Venue):
         aliases: dict[str, str] | None = None,
         exchange=None,
         kinds: tuple[str, ...] = ("spot", "perp"),
+        dead_man_seconds: int = 0,
     ):
         self.name = name
         self.quotes = tuple(quotes)  # accepted quote/settle currencies, most preferred first
@@ -98,6 +116,11 @@ class CcxtVenue(Venue):
                 {"enableRateLimit": True, **(credentials or {}), "options": merged}
             )
         self.ex = exchange
+        if ex_id_of(exchange) == "hyperliquid" and not merged_opt(exchange, "builderFee"):
+            # with an API (agent) wallet the zero-fee approval fails and ccxt would retry it
+            # before every order; there is nothing to approve, so skip it
+            exchange.handle_builder_fee_approval = lambda *a, **k: True
+        self.dead_man_seconds = dead_man_seconds
         self._by_symbol: dict[str, Instrument] = {}
         self._intervals: dict[str, float] = {}
 
@@ -108,7 +131,11 @@ class CcxtVenue(Venue):
         markets = self.ex.load_markets()
         best_spot: dict[str, Instrument] = {}  # one spot market per asset: best-ranked quote
         for sym, m in markets.items():
-            if m.get("active") is False or m.get("expiry"):
+            if m.get("expiry"):
+                continue
+            # Kraken omits `status` on ~13% of pairs and ccxt then marks them inactive
+            unknown = self.ex.id == "kraken" and (m.get("info") or {}).get("status") is None
+            if m.get("active") is False and not unknown:
                 continue
             if m.get("swap") and m.get("linear") and m.get("settle") in self.quotes:
                 kind, quote = Kind.PERP, m["settle"]
@@ -202,7 +229,10 @@ class CcxtVenue(Venue):
             group = {i.symbol: i for i in instruments if i.kind is kind}
             if not group:
                 continue
-            tickers = self.ex.fetch_tickers(list(group))
+            if self.ex.id == "kraken":  # symbols=... silently drops "inactive" pairs
+                tickers = self.ex.fetch_tickers()
+            else:
+                tickers = self.ex.fetch_tickers(list(group))
             missing = []  # e.g. Hyperliquid spot tickers carry no bid/ask at all
             for sym, t in tickers.items():
                 inst = group.get(sym)
@@ -380,7 +410,7 @@ class CcxtVenue(Venue):
         unit = self._unit(inst)
         amount = float(self.ex.amount_to_precision(inst.symbol, qty / unit))
         px = float(self.ex.price_to_precision(inst.symbol, price * inst.multiplier))
-        params: dict = {"postOnly": True}
+        params: dict = {**_ORDER_PARAMS.get(self.ex.id, {}), "postOnly": True}
         if reduce_only and inst.is_perp:
             params["reduceOnly"] = True
         try:
@@ -418,7 +448,7 @@ class CcxtVenue(Venue):
         unit = self._unit(inst)
         amount = float(self.ex.amount_to_precision(inst.symbol, qty / unit))
         price = float(self.ex.price_to_precision(inst.symbol, limit_price * inst.multiplier))
-        params: dict = {"timeInForce": "IOC"}
+        params: dict = {**_ORDER_PARAMS.get(self.ex.id, {}), "timeInForce": "IOC"}
         if reduce_only and inst.is_perp:
             params["reduceOnly"] = True
         import ccxt
@@ -477,8 +507,19 @@ class CcxtVenue(Venue):
 
     def fetch_spot_balance(self, inst: Instrument) -> float:
         base = self.ex.market(inst.symbol)["base"]
-        total = (self.ex.fetch_balance().get("total") or {}).get(base) or 0.0
-        return float(total) * inst.multiplier
+        totals = self.ex.fetch_balance().get("total") or {}
+        # Kraken auto-earn keeps tradable coins under a suffixed code such as "BTC.F"
+        held = sum(float(v or 0) for k, v in totals.items() if k == base or k == f"{base}.F")
+        return held * inst.multiplier
+
+    def heartbeat(self) -> None:
+        """Refresh the venue's cancel-all-after timer, if configured, so resting maker orders
+        are pulled when the bot dies (note: it cancels *all* open orders on the account)."""
+        if self.dead_man_seconds and self.ex.has.get("cancelAllOrdersAfter"):
+            try:
+                self.ex.cancel_all_orders_after(self.dead_man_seconds * 1000)
+            except Exception as exc:
+                log.warning("%s: dead-man switch refresh failed: %s", self.name, exc)
 
     def fetch_funding_payments(self, inst: Instrument, since_ms: int) -> list[tuple[int, float]]:
         rows = self.ex.fetch_funding_history(inst.symbol, since_ms)
