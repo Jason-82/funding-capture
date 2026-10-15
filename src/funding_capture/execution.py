@@ -11,14 +11,23 @@ The dangerous moment in a delta-neutral trade is between the two fills. The exec
    escalate.
 
 It never leaves a slice's exposure open while moving on to the next slice.
+
+Maker mode: for legs on ``maker_venues`` (venues with expensive taker fees, e.g. US spot
+exchanges) the executor instead rests a post-only order at the touch, polls it, and hedges
+each new partial fill on the other leg with IOC as soon as it sees it. The order is
+re-priced when the market moves away and cancelled after ``maker_timeout_s``; whatever
+filled stays hedged and the rest of the trade is simply not done. The engine is blocked
+while this runs, so keep the timeout short.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .models import Candidate, Fill, Instrument, Side
+from .models import Candidate, Fill, Instrument, OrderState, Side
 from .venues.base import Venue
 
 log = logging.getLogger(__name__)
@@ -33,6 +42,9 @@ class ExecutionParams:
     hedge_retries: int = 4
     max_first_leg_misses: int = 3
     residual_tolerance_usd: float = 5.0
+    maker_timeout_s: float = 90.0  # per resting order before giving up on the rest
+    maker_poll_s: float = 2.0
+    maker_requote_bps: float = 5.0  # re-price when the touch moves this far from our order
 
 
 @dataclass
@@ -40,6 +52,15 @@ class _LegPlan:
     inst: Instrument
     order_side: str
     reduce_only: bool
+
+
+@dataclass
+class _Seen:
+    """What has already been recorded from one resting order."""
+
+    qty: float = 0.0
+    cost: float = 0.0
+    fee: float = 0.0
 
 
 @dataclass
@@ -71,9 +92,19 @@ class ExecutionReport:
 
 
 class PairExecutor:
-    def __init__(self, venues: dict[str, Venue], params: ExecutionParams | None = None):
+    def __init__(
+        self,
+        venues: dict[str, Venue],
+        params: ExecutionParams | None = None,
+        maker_venues: tuple[str, ...] = (),
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.venues = venues
         self.p = params or ExecutionParams()
+        self.maker_venues = set(maker_venues)
+        self.sleep = sleep
+        self.clock = clock
 
     # ------------------------------------------------------------------ public API
     def open(self, cand: Candidate, notional_usd: float) -> ExecutionReport:
@@ -94,7 +125,7 @@ class PairExecutor:
 
     def trade_one(self, inst: Instrument, order_side: str, qty: float, reduce_only: bool) -> Fill:
         """Single IOC on one leg (used by the rebalancer)."""
-        q = self.venues[inst.venue].fetch_quotes([inst])[inst.key]
+        q = self.venues[inst.venue].fetch_touch(inst)
         price, _ = q.touch(order_side)
         return self._ioc(
             _LegPlan(inst, order_side, reduce_only), qty, price, self.p.hedge_slippage_bps
@@ -102,13 +133,7 @@ class PairExecutor:
 
     # ------------------------------------------------------------------ internals
     def _quotes(self, legs: list[_LegPlan]):
-        out = []
-        for leg in legs:
-            q = self.venues[leg.inst.venue].fetch_quotes([leg.inst]).get(leg.inst.key)
-            if q is None:
-                raise RuntimeError(f"no quote for {leg.inst.key}")
-            out.append(q)
-        return out
+        return [self.venues[leg.inst.venue].fetch_touch(leg.inst) for leg in legs]
 
     def _round_both(self, a: _LegPlan, b: _LegPlan, qty: float) -> float:
         va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
@@ -123,7 +148,38 @@ class PairExecutor:
             leg.inst, leg.order_side, qty, limit, reduce_only=leg.reduce_only
         )
 
+    def _maker_leg(self, legs: list[_LegPlan]) -> int | None:
+        """Index of the leg to work passively, if any (the pricier one if both qualify)."""
+        idx = [
+            i
+            for i, leg in enumerate(legs)
+            if leg.inst.venue in self.maker_venues
+            and getattr(self.venues[leg.inst.venue], "supports_post_only", False)
+        ]
+        if not idx:
+            return None
+        if len(idx) == 1:
+            return idx[0]
+        return 0 if legs[0].inst.kind == "spot" else 1
+
+    def _hedge(self, b: _LegPlan, qty: float, rep: ExecutionReport) -> float:
+        """IOC ``qty`` on leg ``b`` with widening limits; returns what is still unhedged."""
+        vb = self.venues[b.inst.venue]
+        need = vb.round_qty(b.inst, qty)
+        for attempt in range(self.p.hedge_retries):
+            if need <= 0:
+                break
+            touch_b, _ = self._quotes([b])[0].touch(b.order_side)
+            fb = self._ioc(b, need, touch_b, self.p.hedge_slippage_bps * (attempt + 1))
+            if fb.qty > 0:
+                rep.fills.append(fb)
+                need = vb.round_qty(b.inst, need - fb.qty)
+        return need
+
     def _execute(self, legs: list[_LegPlan], target_qty: float) -> ExecutionReport:
+        m = self._maker_leg(legs)
+        if m is not None:
+            return self._execute_maker(legs[m], legs[1 - m], legs, target_qty)
         rep = ExecutionReport()
         quotes = self._quotes(legs)
         # thinner touch (in USD) goes first: it's the leg most likely to under-fill
@@ -159,15 +215,7 @@ class PairExecutor:
                     break
                 continue
 
-            need = vb.round_qty(b.inst, fa.qty)
-            for attempt in range(self.p.hedge_retries):
-                if need <= 0:
-                    break
-                touch_b, _ = self._quotes([b])[0].touch(b.order_side)
-                fb = self._ioc(b, need, touch_b, self.p.hedge_slippage_bps * (attempt + 1))
-                if fb.qty > 0:
-                    rep.fills.append(fb)
-                    need = vb.round_qty(b.inst, need - fb.qty)
+            need = self._hedge(b, fa.qty, rep)
             rep.hedged_qty += max(0.0, fa.qty - need)
             remaining -= fa.qty
             if need * qb.mid > self.p.residual_tolerance_usd:
@@ -180,6 +228,85 @@ class PairExecutor:
             and abs(target_qty - rep.hedged_qty) * quotes[0].mid <= self.p.residual_tolerance_usd
         )
         return rep
+
+    def _execute_maker(
+        self, m: _LegPlan, h: _LegPlan, legs: list[_LegPlan], target_qty: float
+    ) -> ExecutionReport:
+        rep = ExecutionReport()
+        vm, vh = self.venues[m.inst.venue], self.venues[h.inst.venue]
+        min_qty = max(vm.min_qty(m.inst), vh.min_qty(h.inst))
+        ref_mid = self._quotes([m])[0].mid
+        remaining = target_qty
+        rejects = 0
+        failed = timed_out = False
+        while remaining > 0 and not (failed or timed_out):
+            qm = self._quotes([m])[0]
+            price = qm.bid if m.order_side == "buy" else qm.ask  # join our side of the book
+            slice_qty = self._round_both(m, h, min(remaining, self.p.max_slice_usd / qm.mid))
+            if slice_qty <= 0 or slice_qty < min_qty:
+                if remaining * qm.mid > self.p.residual_tolerance_usd:
+                    rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
+                break
+            oid = vm.place_post_only(m.inst, m.order_side, slice_qty, price, m.reduce_only)
+            if oid is None:  # the book moved and we would have crossed; re-read and retry
+                rejects += 1
+                if rejects >= self.p.max_first_leg_misses:
+                    rep.messages.append(f"post-only on {m.inst.key} kept crossing; aborted")
+                    break
+                continue
+            seen = _Seen()
+            started = self.clock()
+            while True:
+                self.sleep(self.p.maker_poll_s)
+                st = vm.fetch_order_state(m.inst, oid)
+                if not self._absorb(m, h, st, seen, rep):
+                    self._absorb(m, h, vm.cancel_order(m.inst, oid), seen, rep)
+                    failed = True
+                    break
+                if not st.is_open:
+                    break
+                expired = self.clock() - started >= self.p.maker_timeout_s
+                if not expired and not self._moved_away(m, price):
+                    continue
+                timed_out = expired  # otherwise: re-price at the new touch
+                if not self._absorb(m, h, vm.cancel_order(m.inst, oid), seen, rep):
+                    failed = True
+                break
+            remaining -= seen.qty
+            if timed_out:
+                rep.messages.append(
+                    f"maker order on {m.inst.key} timed out; {remaining:.6g} not traded"
+                )
+        self._record_residual(legs, rep, ref_mid)
+        rep.complete = (
+            not rep.has_residual
+            and abs(target_qty - rep.hedged_qty) * ref_mid <= self.p.residual_tolerance_usd
+        )
+        return rep
+
+    def _absorb(
+        self, m: _LegPlan, h: _LegPlan, st: OrderState, seen: _Seen, rep: ExecutionReport
+    ) -> bool:
+        """Record new maker fills and hedge them. False if the hedge could not be done."""
+        new = st.filled - seen.qty
+        if new <= 1e-12:
+            return True
+        cost_now = st.filled * (st.avg_price or 0.0)
+        price = (cost_now - seen.cost) / new if new > 0 else (st.avg_price or 0.0)
+        rep.fills.append(Fill(m.inst, m.order_side, new, price, st.fee_usd - seen.fee, st.order_id))
+        seen.qty, seen.cost, seen.fee = st.filled, cost_now, st.fee_usd
+        need = self._hedge(h, new, rep)
+        rep.hedged_qty += max(0.0, new - need)
+        if need * price > self.p.residual_tolerance_usd:
+            self._unwind(m, need, rep)
+            return False
+        return True
+
+    def _moved_away(self, m: _LegPlan, our_price: float) -> bool:
+        q = self._quotes([m])[0]
+        best = q.bid if m.order_side == "buy" else q.ask
+        drift = (best - our_price) if m.order_side == "buy" else (our_price - best)
+        return drift / our_price * 1e4 > self.p.maker_requote_bps
 
     def _unwind(self, leg: _LegPlan, qty: float, rep: ExecutionReport) -> None:
         # undoing an opening order reduces the position; undoing a closing order re-opens it

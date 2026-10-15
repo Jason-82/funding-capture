@@ -52,3 +52,31 @@ def test_store_roundtrip_and_backtest_cli(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "APR on capital" in out
     assert trades.exists()
+
+
+def test_save_universe_keeps_spot_only_venue_markets(tmp_path):
+    from funding_capture.data import save_universe
+
+    store = HistoryStore(tmp_path)
+    hl_perp = perp("hyperliquid", "WIF", quote="USDC")
+    kr = [spot("kraken", "WIF", quote="USD"), spot("kraken", "DOGE", quote="USD")]
+    save_universe(store, {"hyperliquid": [hl_perp], "kraken": kr}, {"hyperliquid": [hl_perp]})
+    assert [i.asset for i in store.load_instruments("kraken")] == ["WIF"]  # DOGE has no perp
+    assert store.load_instruments("hyperliquid") == [hl_perp]
+
+
+def test_env_file_loader(tmp_path, monkeypatch):
+    from funding_capture.cli import load_env_file
+
+    env = tmp_path / ".env"
+    env.write_text('# keys\nexport KRAKEN_API_KEY="abc"\nKRAKEN_SECRET=s3cr=t\nEXISTING=new\n')
+    monkeypatch.setenv("EXISTING", "old")
+    monkeypatch.delenv("KRAKEN_API_KEY", raising=False)
+    monkeypatch.delenv("KRAKEN_SECRET", raising=False)
+    assert load_env_file(str(env)) == 2
+    import os
+
+    assert os.environ["KRAKEN_API_KEY"] == "abc"
+    assert os.environ["KRAKEN_SECRET"] == "s3cr=t"
+    assert os.environ["EXISTING"] == "old"  # never overrides the real environment
+    assert load_env_file(str(tmp_path / "missing")) == 0

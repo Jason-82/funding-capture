@@ -2,8 +2,13 @@
 
 Fills: an IOC order fills against the current touch if its limit crosses it, up to the
 displayed touch size (scaled by ``touch_fraction``), at the touch price, paying the
-venue's taker fee. Funding: when a perp's settlement time passes, each open position is
-paid/charged the last rate observed before the settlement, on its notional at mark.
+venue's taker fee. A resting post-only order fills in full at its own price, paying the
+maker fee, once the market trades through its level (for a buy: the best bid drops below
+it or the ask comes down to it). Queue position is ignored, so this is optimistic about
+*when* maker orders fill but never about the price.
+
+Funding: when a perp's settlement time passes, each open position is paid/charged the last
+rate observed before the settlement, on its notional at mark.
 """
 
 from __future__ import annotations
@@ -13,7 +18,15 @@ import math
 from dataclasses import dataclass, field
 
 from ..costs import VenueFees
-from ..models import Fill, FundingSnapshot, Instrument, Kind, PerpPositionInfo, Quote
+from ..models import (
+    Fill,
+    FundingSnapshot,
+    Instrument,
+    Kind,
+    OrderState,
+    PerpPositionInfo,
+    Quote,
+)
 from .base import Venue, floor_to_step
 
 
@@ -31,7 +44,21 @@ class PaperState:
     fees_usd: float = 0.0
 
 
+@dataclass
+class _Resting:
+    inst: Instrument
+    side: str
+    qty: float
+    price: float
+    reduce_only: bool
+    filled: float = 0.0
+    fee_usd: float = 0.0
+    is_open: bool = True
+
+
 class PaperVenue(Venue):
+    supports_post_only = True
+
     def __init__(
         self,
         data: Venue,
@@ -51,6 +78,7 @@ class PaperVenue(Venue):
         self.state = PaperState()
         self._ids = itertools.count(1)
         self._instruments: dict[str, Instrument] = {}
+        self._resting: dict[str, _Resting] = {}
 
     # -- data: delegate ---------------------------------------------------------------
     def load_instruments(self) -> list[Instrument]:
@@ -63,6 +91,9 @@ class PaperVenue(Venue):
 
     def fetch_quotes(self, instruments) -> dict[str, Quote]:
         return self.data.fetch_quotes(instruments)
+
+    def fetch_touch(self, inst: Instrument) -> Quote:
+        return self.data.fetch_touch(inst)
 
     def fetch_volumes(self, instruments) -> dict[str, float]:
         return self.data.fetch_volumes(instruments)
@@ -84,9 +115,12 @@ class PaperVenue(Venue):
 
     def place_ioc(self, inst, order_side, qty, limit_price, reduce_only=False) -> Fill:
         qty = self.round_qty(inst, qty)
-        quote = self.data.fetch_quotes([inst]).get(inst.key)
         empty = Fill(inst, order_side, 0.0, limit_price, 0.0, None)
-        if quote is None or qty <= 0:
+        if qty <= 0:
+            return empty
+        try:
+            quote = self.data.fetch_touch(inst)
+        except Exception:
             return empty
         price, size = quote.touch(order_side)
         crosses = price <= limit_price if order_side == "buy" else price >= limit_price
@@ -109,6 +143,47 @@ class PaperVenue(Venue):
             if snap is not None:
                 self.state.pending[inst.key] = (snap.rate, snap.next_funding_ts)
         return Fill(inst, order_side, fill_qty, price, fee, f"paper-{next(self._ids)}")
+
+    def place_post_only(self, inst, order_side, qty, price, reduce_only=False) -> str | None:
+        qty = self.round_qty(inst, qty)
+        touch = self.data.fetch_touch(inst)
+        crosses = price >= touch.ask if order_side == "buy" else price <= touch.bid
+        if crosses or qty <= 0:
+            return None
+        oid = f"paper-po-{next(self._ids)}"
+        self._resting[oid] = _Resting(inst, order_side, qty, price, reduce_only)
+        return oid
+
+    def fetch_order_state(self, inst, order_id) -> OrderState:
+        o = self._resting[order_id]
+        if o.is_open:
+            t = self.data.fetch_touch(inst)
+            if o.side == "buy":
+                traded_through = t.bid < o.price or t.ask <= o.price
+            else:
+                traded_through = t.ask > o.price or t.bid >= o.price
+            if traded_through:
+                qty = o.qty - o.filled
+                book = self._book(inst)
+                sign = 1 if o.side == "buy" else -1
+                if o.reduce_only:
+                    qty = min(qty, max(0.0, -sign * book.qty))
+                fee = qty * o.price * self.fees.fee(inst.kind, taker=False)
+                self._apply(book, sign * qty, o.price)
+                self.state.fees_usd += fee
+                o.filled += qty
+                o.fee_usd += fee
+                o.is_open = False
+                if inst.is_perp and inst.key not in self.state.pending:
+                    snap = self.data.fetch_funding([inst]).get(inst.key)
+                    if snap is not None:
+                        self.state.pending[inst.key] = (snap.rate, snap.next_funding_ts)
+        return OrderState(order_id, o.filled, o.price if o.filled else None, o.fee_usd, o.is_open)
+
+    def cancel_order(self, inst, order_id) -> OrderState:
+        st = self.fetch_order_state(inst, order_id)  # a fill can race the cancel
+        self._resting[order_id].is_open = False
+        return OrderState(order_id, st.filled, st.avg_price, st.fee_usd, False)
 
     @staticmethod
     def _apply(book: _Book, signed_qty: float, price: float) -> None:

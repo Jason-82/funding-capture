@@ -8,11 +8,20 @@ subaccount routing) need checking on each venue with tiny size before real use.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 
-from ..models import Fill, FundingSnapshot, Instrument, Kind, PerpPositionInfo, Quote
+from ..models import (
+    Fill,
+    FundingSnapshot,
+    Instrument,
+    Kind,
+    OrderState,
+    PerpPositionInfo,
+    Quote,
+)
 from ..rates import DEFAULT_INTERVAL_HOURS, parse_interval_hours
 from ..symbols import canonical_asset
 from .base import Venue
@@ -30,13 +39,22 @@ _CRED_FIELDS = {
 
 
 def credentials_from_env(venue: str) -> dict[str, str]:
-    """``BINANCE_API_KEY`` etc. -> ccxt constructor fields. Never put keys in config files."""
+    """``KRAKEN_API_KEY`` etc. -> ccxt constructor fields. Never put keys in config files.
+
+    Each value may instead come from a file named by ``<NAME>_FILE`` (handy for multi-line
+    PEM keys such as Coinbase's), and a literal ``\\n`` in a value is turned into a newline.
+    """
     prefix = venue.upper()
-    return {
-        field: os.environ[f"{prefix}_{suffix}"]
-        for field, suffix in _CRED_FIELDS.items()
-        if os.environ.get(f"{prefix}_{suffix}")
-    }
+    out: dict[str, str] = {}
+    for field, suffix in _CRED_FIELDS.items():
+        name = f"{prefix}_{suffix}"
+        value = os.environ.get(name)
+        if not value and os.environ.get(f"{name}_FILE"):
+            with open(os.path.expanduser(os.environ[f"{name}_FILE"])) as f:
+                value = f.read().strip()
+        if value:
+            out[field] = value.replace("\\n", "\n")
+    return out
 
 
 class CcxtVenue(Venue):
@@ -49,9 +67,11 @@ class CcxtVenue(Venue):
         options: dict | None = None,
         aliases: dict[str, str] | None = None,
         exchange=None,
+        kinds: tuple[str, ...] = ("spot", "perp"),
     ):
         self.name = name
-        self.quotes = tuple(quotes)
+        self.quotes = tuple(quotes)  # accepted quote/settle currencies, most preferred first
+        self.kinds = {Kind(k) for k in kinds}
         self.aliases = aliases
         if exchange is None:
             import ccxt
@@ -69,6 +89,7 @@ class CcxtVenue(Venue):
         if self._by_symbol:
             return list(self._by_symbol.values())
         markets = self.ex.load_markets()
+        best_spot: dict[str, Instrument] = {}  # one spot market per asset: best-ranked quote
         for sym, m in markets.items():
             if m.get("active") is False or m.get("expiry"):
                 continue
@@ -79,10 +100,17 @@ class CcxtVenue(Venue):
                 kind, quote, contract_size = Kind.SPOT, m["quote"], 1.0
             else:
                 continue
+            if kind not in self.kinds:
+                continue
             asset, mult = canonical_asset(m["base"], self.aliases)
-            self._by_symbol[sym] = Instrument(
-                self.name, sym, asset, kind, quote, mult, contract_size
-            )
+            inst = Instrument(self.name, sym, asset, kind, quote, mult, contract_size)
+            if kind is Kind.PERP:
+                self._by_symbol[sym] = inst
+                continue
+            cur = best_spot.get(asset)
+            if cur is None or self.quotes.index(quote) < self.quotes.index(cur.quote):
+                best_spot[asset] = inst
+        self._by_symbol.update({i.symbol: i for i in best_spot.values()})
         self._load_intervals()
         return list(self._by_symbol.values())
 
@@ -166,6 +194,9 @@ class CcxtVenue(Venue):
                 )
         return out
 
+    def fetch_touch(self, inst: Instrument) -> Quote:
+        return self.fetch_order_book_quote(inst)
+
     def fetch_order_book_quote(self, inst: Instrument, depth: int = 5) -> Quote:
         """Top of book from the order book (sizes are more reliable than tickers)."""
         ob = self.ex.fetch_order_book(inst.symbol, depth)
@@ -212,6 +243,60 @@ class CcxtVenue(Venue):
         mn = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0.0
         return float(mn) * self._unit(inst)
 
+    @property
+    def supports_post_only(self) -> bool:  # type: ignore[override]
+        return bool(self.ex.has.get("createPostOnlyOrder") or self.ex.has.get("createOrder"))
+
+    def _order_state(self, inst: Instrument, order: dict) -> OrderState:
+        unit = self._unit(inst)
+        filled = float(order.get("filled") or 0.0) * unit
+        avg = order.get("average") or (order.get("price") if filled else None)
+        fee_usd = 0.0
+        base = self.ex.market(inst.symbol).get("base")
+        for fee in order.get("fees") or ([order["fee"]] if order.get("fee") else []):
+            cost = float(fee.get("cost") or 0.0)
+            if fee.get("currency") == base:
+                filled -= cost * inst.multiplier
+                fee_usd += cost * float(avg or 0.0)
+            else:
+                fee_usd += cost
+        return OrderState(
+            str(order.get("id")),
+            filled,
+            float(avg) / inst.multiplier if avg else None,
+            fee_usd,
+            order.get("status") == "open",
+        )
+
+    def place_post_only(self, inst, order_side, qty, price, reduce_only=False) -> str | None:
+        import ccxt
+
+        unit = self._unit(inst)
+        amount = float(self.ex.amount_to_precision(inst.symbol, qty / unit))
+        px = float(self.ex.price_to_precision(inst.symbol, price * inst.multiplier))
+        params: dict = {"postOnly": True}
+        if reduce_only and inst.is_perp:
+            params["reduceOnly"] = True
+        try:
+            order = self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params)
+        except ccxt.OrderImmediatelyFillable:
+            return None
+        if order.get("status") in ("canceled", "cancelled", "rejected", "expired"):
+            return None  # some venues accept then cancel a post-only that would cross
+        return str(order["id"])
+
+    def fetch_order_state(self, inst, order_id) -> OrderState:
+        return self._order_state(inst, self.ex.fetch_order(order_id, inst.symbol))
+
+    def cancel_order(self, inst, order_id) -> OrderState:
+        import ccxt
+
+        with contextlib.suppress(ccxt.OrderNotFound):  # already filled/gone: state says which
+            self.ex.cancel_order(order_id, inst.symbol)
+        st = self.fetch_order_state(inst, order_id)
+        st.is_open = False
+        return st
+
     def place_ioc(
         self,
         inst: Instrument,
@@ -250,6 +335,8 @@ class CcxtVenue(Venue):
     def fetch_perp_positions(self) -> dict[str, PerpPositionInfo]:
         self.load_instruments()
         out: dict[str, PerpPositionInfo] = {}
+        if Kind.PERP not in self.kinds:
+            return out
         for p in self.ex.fetch_positions():
             inst = self._by_symbol.get(p.get("symbol"))
             contracts = float(p.get("contracts") or 0.0)

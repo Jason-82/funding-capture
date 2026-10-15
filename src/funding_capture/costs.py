@@ -45,7 +45,9 @@ class CostModel:
     fees: dict[str, VenueFees] = field(default_factory=lambda: dict(DEFAULT_FEES))
     default_fees: VenueFees = field(default_factory=VenueFees)
     slippage_bps: float = 3.0  # per fill, on top of fees (half-spread + impact)
-    taker: bool = True  # assume aggressive fills; set False if you work maker orders
+    taker: bool = True  # assume aggressive fills everywhere except maker_venues
+    # Legs on these venues are worked with post-only orders: maker fee, no slippage.
+    maker_venues: tuple[str, ...] = ()
     borrow_apr: float = 0.10  # assumed margin-borrow cost for short-spot legs
     perp_leverage: float = 2.0  # notional / margin posted on each perp leg
     spot_short_margin: float = 0.5  # margin posted per $ of borrowed spot sold short
@@ -56,6 +58,8 @@ class CostModel:
     def leg_cost(self, inst: Instrument) -> float:
         """Cost fraction of one fill (one side, one leg)."""
         fees = self.fees.get(inst.venue, self.default_fees)
+        if inst.venue in self.maker_venues:
+            return fees.fee(inst.kind, taker=False)
         return fees.fee(inst.kind, self.taker) + self.slippage_bps / 1e4
 
     def round_trip_cost(self, cand: Candidate) -> float:

@@ -22,7 +22,8 @@ from .risk import RiskLimits
 class VenueSettings:
     name: str
     ccxt_id: str | None = None
-    quotes: tuple[str, ...] = ("USDT", "USDC")
+    quotes: tuple[str, ...] = ("USDT", "USDC")  # most preferred first
+    kinds: tuple[str, ...] = ("spot", "perp")  # e.g. [spot] to use a venue only for spot legs
     options: dict = field(default_factory=dict)  # passed to the ccxt constructor
     paper_leverage: float = 2.0
 

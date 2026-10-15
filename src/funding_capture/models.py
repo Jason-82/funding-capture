@@ -164,6 +164,17 @@ class Fill:
 
 
 @dataclass
+class OrderState:
+    """Cumulative state of a resting (post-only) order, in canonical units."""
+
+    order_id: str
+    filled: float  # canonical units filled so far (net of any fee taken in the coin)
+    avg_price: float | None  # USD per canonical unit over the filled quantity
+    fee_usd: float
+    is_open: bool
+
+
+@dataclass
 class PerpPositionInfo:
     """What a venue reports about an open perp position."""
 

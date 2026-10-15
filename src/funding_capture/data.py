@@ -105,31 +105,32 @@ def interval_for(inst: Instrument, rows: list[tuple[int, float]]) -> float:
     return inferred or DEFAULT_INTERVAL_HOURS.get(inst.venue, 8.0)
 
 
-def download_funding_history(
-    venue,  # venues.ccxt_venue.CcxtVenue (kept untyped to avoid importing ccxt here)
-    store: HistoryStore,
-    since_ms: int,
-    until_ms: int | None = None,
+def select_perps(
+    instruments: list[Instrument],
+    venue=None,
     assets: set[str] | None = None,
     min_volume_usd: float = 0.0,
     max_markets: int | None = None,
-) -> dict[str, int]:
-    """Download settled funding for a venue's perps into ``store``; resumes per symbol."""
-    instruments = venue.load_instruments()
-    if assets:
-        instruments = [i for i in instruments if i.asset in assets]
-    perps = [i for i in instruments if i.kind is Kind.PERP]
-    if min_volume_usd > 0 or max_markets:
+) -> list[Instrument]:
+    """Perps worth downloading: optional asset filter, then the most traded first."""
+    perps = [i for i in instruments if i.kind is Kind.PERP and (not assets or i.asset in assets)]
+    if venue is not None and perps and (min_volume_usd > 0 or max_markets):
         vols = venue.fetch_volumes(perps)
         perps = [p for p in perps if vols.get(p.key, 0.0) >= min_volume_usd]
         perps.sort(key=lambda p: -vols.get(p.key, 0.0))
         if max_markets:
             perps = perps[:max_markets]
-    keep_assets = {p.asset for p in perps}
-    store.save_instruments(
-        venue.name,
-        perps + [i for i in instruments if i.kind is Kind.SPOT and i.asset in keep_assets],
-    )
+    return perps
+
+
+def download_funding_history(
+    venue,  # venues.ccxt_venue.CcxtVenue (kept untyped to avoid importing ccxt here)
+    store: HistoryStore,
+    perps: list[Instrument],
+    since_ms: int,
+    until_ms: int | None = None,
+) -> dict[str, int]:
+    """Download settled funding for ``perps`` into ``store``; resumes per symbol."""
     added: dict[str, int] = {}
     for n, inst in enumerate(perps, 1):
         existing = store.load_funding(inst)
@@ -142,3 +143,20 @@ def download_funding_history(
         added[inst.key] = store.append_funding(inst, rows)
         log.info("[%d/%d] %s %s +%d", n, len(perps), venue.name, inst.symbol, added[inst.key])
     return added
+
+
+def save_universe(
+    store: HistoryStore,
+    venue_instruments: dict[str, list[Instrument]],
+    venue_perps: dict[str, list[Instrument]],
+) -> None:
+    """Write instruments.json per venue: its selected perps plus every spot market for an
+    asset that has a perp anywhere in the store (so spot-only venues can hedge them)."""
+    for venue in venue_perps:
+        store.save_instruments(venue, venue_perps[venue])
+    perp_assets = {
+        i.asset for v in store.venues() for i in store.load_instruments(v) if i.kind is Kind.PERP
+    }
+    for venue, insts in venue_instruments.items():
+        spots = [i for i in insts if i.kind is Kind.SPOT and i.asset in perp_assets]
+        store.save_instruments(venue, venue_perps.get(venue, []) + spots)

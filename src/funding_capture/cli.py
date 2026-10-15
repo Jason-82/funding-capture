@@ -1,4 +1,4 @@
-"""Command line: fcap scan | fetch | backtest | sweep | paper | live."""
+"""Command line: fcap check | scan | fetch | backtest | sweep | paper | live | status."""
 
 from __future__ import annotations
 
@@ -10,6 +10,30 @@ from datetime import UTC, datetime, timedelta
 from .config import Settings, load_settings
 
 log = logging.getLogger("funding_capture")
+
+
+def load_env_file(path: str) -> int:
+    """Load KEY=VALUE lines into the environment (existing variables win). Returns count."""
+    import os
+    from pathlib import Path
+
+    p = Path(path).expanduser()
+    if not p.exists():
+        return 0
+    n = 0
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.removeprefix("export ").strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+            n += 1
+    return n
 
 
 def _ms(date: str | None) -> int | None:
@@ -26,8 +50,120 @@ def _data_venues(settings: Settings, names: list[str] | None = None, auth: bool 
         if names and vs.name not in names:
             continue
         creds = credentials_from_env(vs.name) if auth else None
-        out[vs.name] = CcxtVenue(vs.name, vs.ccxt_id, vs.quotes, creds, vs.options)
+        out[vs.name] = CcxtVenue(vs.name, vs.ccxt_id, vs.quotes, creds, vs.options, kinds=vs.kinds)
     return out
+
+
+def _check_venue(venue, has_creds: bool, step) -> None:
+    from .models import Kind
+
+    insts = (
+        step(
+            "markets",
+            venue.load_instruments,
+            lambda r: (
+                f"{sum(i.kind is Kind.PERP for i in r)} perps, "
+                f"{sum(i.kind is Kind.SPOT for i in r)} spot markets"
+            ),
+        )
+        or []
+    )
+    perps = [i for i in insts if i.kind is Kind.PERP][:3]
+    spots = [i for i in insts if i.kind is Kind.SPOT][:3]
+    if perps:
+        step(
+            "funding",
+            lambda: venue.fetch_funding(perps),
+            lambda r: ", ".join(
+                f"{x.instrument.asset} {x.rate:+.6f}/{x.interval_hours:g}h" for x in r.values()
+            ),
+        )
+    if perps or spots:
+        sample = (perps + spots)[:4]
+        step(
+            "quotes",
+            lambda: venue.fetch_quotes(sample),
+            lambda r: ", ".join(
+                f"{k.split(':', 1)[1]} {q.bid:.6g}/{q.ask:.6g}" for k, q in r.items()
+            ),
+        )
+    if not has_creds:
+        print("  skip  account checks (no API credentials in the environment)")
+        return
+    step(
+        "balance",
+        venue.ex.fetch_balance,
+        lambda r: (
+            ", ".join(f"{k} {v:,.6g}" for k, v in list((r.get("total") or {}).items()) if v)
+            or "empty"
+        ),
+    )
+    if perps:
+        step(
+            "positions",
+            venue.fetch_perp_positions,
+            lambda r: (
+                ", ".join(f"{p.instrument.symbol} {p.qty:+.6g}" for p in r.values()) or "none"
+            ),
+        )
+
+
+def cmd_check(args, settings: Settings) -> None:
+    """Connectivity, market data and (if keys are set) account access, per venue."""
+    from .venues.ccxt_venue import credentials_from_env
+
+    failures = 0
+
+    def step(label, fn, describe):
+        nonlocal failures
+        try:
+            result = fn()
+            print(f"  ok    {label}: {describe(result)}")
+            return result
+        except Exception as exc:
+            failures += 1
+            print(f"  FAIL  {label}: {type(exc).__name__}: {str(exc)[:300]}")
+            return None
+
+    for name, venue in _data_venues(settings, auth=True).items():
+        creds = credentials_from_env(name)
+        print(f"{name}  (ccxt id: {venue.ex.id}; credentials: {sorted(creds) or 'none'})")
+        _check_venue(venue, bool(creds), step)
+    if failures:
+        sys.exit(f"{failures} check(s) failed")
+
+
+def cmd_status(args, settings: Settings) -> None:
+    """Print positions and P&L from the engine's state file (works while it runs)."""
+    from pathlib import Path
+
+    from .state import load_json, position_from_dict
+
+    path = Path(settings.portfolio.state_dir) / "engine.json"
+    data = load_json(path)
+    if not data:
+        sys.exit(f"no state at {path}; has `fcap paper` or `fcap live` run yet?")
+    open_ = [position_from_dict(d) for d in data.get("positions", [])]
+    closed = [position_from_dict(d) for d in data.get("closed", [])]
+    print(f"state: {path}")
+    print(f"open pairs: {len(open_)}")
+    for p in open_:
+        age_h = (datetime.now(UTC).timestamp() * 1000 - p.opened_ms) / 3_600_000
+        print(
+            f"  {p.id}  {p.candidate.describe()}  qty={p.qty:.6g} "
+            f"notional=${p.entry_notional:,.0f}  age={age_h:.1f}h  "
+            f"funding=${p.funding_usd:,.2f}  fees=${p.entry_fees_usd + p.exit_fees_usd:,.2f}"
+        )
+        for note in p.notes[-3:]:
+            print(f"      - {note}")
+    print(f"closed pairs: {len(closed)}")
+    for p in closed[-args.last :]:
+        print(
+            f"  {p.id}  {p.candidate.describe()}  net=${p.net_pnl_usd:,.2f} "
+            f"(funding ${p.funding_usd:,.2f}, fees ${p.entry_fees_usd + p.exit_fees_usd:,.2f}, "
+            f"price ${p.realized_price_usd:,.2f})  {p.notes[-1] if p.notes else ''}"
+        )
+    print(f"realised net P&L: ${sum(p.net_pnl_usd for p in closed):,.2f}")
 
 
 def cmd_scan(args, settings: Settings) -> None:
@@ -41,7 +177,7 @@ def cmd_scan(args, settings: Settings) -> None:
 
 
 def cmd_fetch(args, settings: Settings) -> None:
-    from .data import HistoryStore, download_funding_history
+    from .data import HistoryStore, download_funding_history, save_universe, select_perps
 
     store = HistoryStore(settings.data_dir)
     since = _ms(args.since) or int(
@@ -49,12 +185,24 @@ def cmd_fetch(args, settings: Settings) -> None:
     )
     assets = set(args.assets.split(",")) if args.assets else None
     names = args.venues.split(",") if args.venues else None
+    venue_instruments, venue_perps = {}, {}
     for name, venue in _data_venues(settings, names).items():
-        log.info("downloading %s", name)
-        added = download_funding_history(
-            venue, store, since, _ms(args.until), assets, args.min_volume, args.max_markets
+        try:
+            insts = venue.load_instruments()
+        except Exception as exc:
+            log.error("%s: cannot load markets (%s); skipping", name, exc)
+            continue
+        perps = select_perps(insts, venue, assets, args.min_volume, args.max_markets)
+        venue_instruments[name], venue_perps[name] = insts, perps
+        log.info(
+            "%s: %d spot markets, downloading %d perps",
+            name,
+            sum(i.kind.value == "spot" for i in insts),
+            len(perps),
         )
+        added = download_funding_history(venue, store, perps, since, _ms(args.until))
         log.info("%s: %d markets, %d new settlements", name, len(added), sum(added.values()))
+    save_universe(store, venue_instruments, venue_perps)
 
 
 def _backtester(args, settings: Settings):
@@ -119,7 +267,7 @@ def _engine(settings: Settings, live: bool):
             n: PaperVenue(v, settings.costs.fees.get(n), leverage=lev.get(n, 2.0))
             for n, v in data.items()
         }
-    executor = PairExecutor(venues, settings.execution)
+    executor = PairExecutor(venues, settings.execution, settings.costs.maker_venues)
     return Engine(
         venues,
         settings.strategy,
@@ -148,7 +296,16 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="fcap", description=__doc__)
     p.add_argument("-c", "--config", default=None, help="YAML config (see config.example.yaml)")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--env-file", default=".env", help="API keys file (default: ./.env)")
+    p.add_argument("--log-file", help="also append logs to this file")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("check", help="test connectivity, market data and API keys per venue")
+    s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("status", help="show positions and P&L from the engine state file")
+    s.add_argument("--last", type=int, default=20, help="closed pairs to list")
+    s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("scan", help="rank live opportunities across venues")
     s.add_argument("--top", type=int, default=25)
@@ -190,10 +347,18 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_live)
 
     args = p.parse_args(argv)
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
     )
+    logging.getLogger("ccxt").setLevel(logging.WARNING)  # ccxt is chatty at DEBUG
+    loaded = load_env_file(args.env_file)
+    if loaded:
+        log.debug("loaded %d variables from %s", loaded, args.env_file)
     args.fn(args, load_settings(args.config))
 
 

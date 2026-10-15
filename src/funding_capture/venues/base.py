@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 
-from ..models import FundingSnapshot, Instrument, PerpPositionInfo, Quote
+from ..models import FundingSnapshot, Instrument, OrderState, PerpPositionInfo, Quote
 
 
 class Venue(ABC):
@@ -23,6 +23,13 @@ class Venue(ABC):
 
     @abstractmethod
     def fetch_quotes(self, instruments: list[Instrument]) -> dict[str, Quote]: ...
+
+    def fetch_touch(self, inst: Instrument) -> Quote:
+        """Best bid/ask with sizes for one instrument, as fresh as possible (for trading)."""
+        q = self.fetch_quotes([inst]).get(inst.key)
+        if q is None:
+            raise RuntimeError(f"no quote for {inst.key}")
+        return q
 
     def fetch_volumes(self, instruments: list[Instrument]) -> dict[str, float]:
         quotes = self.fetch_quotes(instruments)
@@ -51,6 +58,23 @@ class Venue(ABC):
         reduce_only: bool = False,
     ):
         """Immediate-or-cancel limit order; returns a ``Fill`` (qty may be 0)."""
+
+    # Resting (maker) orders. Venues that can't do post-only leave these unimplemented and
+    # the executor falls back to IOC on them.
+    supports_post_only: bool = False
+
+    def place_post_only(
+        self, inst: Instrument, order_side: str, qty: float, price: float, reduce_only=False
+    ) -> str | None:
+        """Rest a post-only limit; returns the order id, or None if it would have crossed."""
+        raise NotImplementedError
+
+    def fetch_order_state(self, inst: Instrument, order_id: str) -> OrderState:
+        raise NotImplementedError
+
+    def cancel_order(self, inst: Instrument, order_id: str) -> OrderState:
+        """Cancel (if still open) and return the final state, including late fills."""
+        raise NotImplementedError
 
     @abstractmethod
     def fetch_perp_positions(self) -> dict[str, PerpPositionInfo]: ...
