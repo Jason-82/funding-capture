@@ -38,14 +38,60 @@ log = logging.getLogger(__name__)
 
 _FINAL_STATES = {"FILLED", "CANCELLED", "EXPIRED", "FAILED"}  # anything else may still fill
 # gRPC-gateway error bodies ccxt raises as plain ExchangeError: transient, worth a retry
-_TRANSIENT = {"INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"}
-# of those, the ones after which a create may have gone through anyway
-_AMBIGUOUS = {"INTERNAL", "DEADLINE_EXCEEDED", "UNAVAILABLE"}
+_TRANSIENT = {
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DEADLINE_EXCEEDED",
+    "RESOURCE_EXHAUSTED",
+    "UNKNOWN",
+    "CANCELLED",
+    "ABORTED",
+    "DATA_LOSS",
+}
+# gRPC codes that refuse a request outright: an order create that got one was not placed
+_REFUSED = {
+    "INVALID_ARGUMENT",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "UNAUTHENTICATED",
+    "FAILED_PRECONDITION",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+}
 
 
 def _error_code(exc) -> str:
     body = _json_in(str(exc))
     return str(body.get("error", "")).upper() if isinstance(body, dict) else ""
+
+
+def _create_failure(exc: Exception) -> str:
+    """What a failed order create says about the order: "refused" (not placed, and a
+    resend won't help), "busy" (not placed, worth resending: rate limits, a proxy's 4xx
+    page) or "maybe" (it may have gone in: timeouts, dropped connections, 5xx pages,
+    gateway codes such as INTERNAL, UNKNOWN or CANCELLED, and anything not recognised)."""
+    import ccxt
+
+    code = _error_code(exc)
+    limited = (ccxt.DDoSProtection, ccxt.RateLimitExceeded, ccxt.InvalidNonce)
+    if code == "RESOURCE_EXHAUSTED" or isinstance(exc, limited):
+        return "busy"
+    refusals = (
+        ccxt.AuthenticationError,
+        ccxt.BadRequest,
+        ccxt.InvalidOrder,
+        ccxt.InsufficientFunds,
+    )
+    if code in _REFUSED or isinstance(exc, refusals):
+        return "refused"
+    if isinstance(exc, ccxt.RequestTimeout):
+        return "maybe"
+    # ccxt words an HTTP error without a JSON body '<id> <method> <url> <status> ...'
+    status = re.match(r"\S+ [A-Z]+ \S+ (\d\d\d) ", str(exc))
+    if status and status.group(1).startswith("4"):
+        return "busy"  # a 4xx page from a proxy in front of Coinbase: it never got through
+    return "maybe"
 
 
 def _f(value, default: float = 0.0) -> float:
@@ -298,7 +344,6 @@ class CoinbaseVenue(CcxtVenue):
         ccxt raises ExchangeError('coinbase ' + body) for any reply carrying
         ``error_response`` (even HTTP 200); we recover the body so callers can read the
         rejection reason."""
-        import ccxt
 
         cfg = {"base_size": str(int(contracts)), "limit_price": limit_px}
         if config_name == "limit_limit_gtc":
@@ -309,35 +354,63 @@ class CoinbaseVenue(CcxtVenue):
             "side": side.upper(),
             "order_configuration": {config_name: cfg},
         }
+        return self._resend(
+            lambda: self.ex.v3PrivatePostBrokerageOrders(body),
+            body["client_order_id"],
+            rejection=lambda exc, err: err,
+            post_only=post_only,
+        )
+
+    def _resend(self, send, cid: str, rejection, post_only: bool):
+        """Run ``send`` (an order create under our client_order_id ``cid``) until Coinbase
+        answers. A repeated client_order_id returns the existing order instead of placing a
+        second one, so a create whose reply was lost is resent as is. A rejection goes to
+        ``rejection(exc, body)``. Raises OrderOutcomeUnknown when some try may have placed
+        the order but no answer says so."""
+        import ccxt
+
         ambiguous = False  # some try may have placed the order without us hearing back
         for attempt in range(6):
             try:
-                # resending the same client_order_id returns the existing order instead of
-                # placing a second one, so a reply lost to a timeout is safe to retry
-                return self.ex.v3PrivatePostBrokerageOrders(body)
-            except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
-                err = _json_in(str(exc))
-                if isinstance(err, dict) and ("error_response" in err or "success" in err):
-                    return err  # a rejection: the caller reads the reason
-                code = _error_code(exc)
-                if not isinstance(exc, ccxt.NetworkError) and code not in _TRANSIENT:
-                    raise
-                ambiguous |= isinstance(exc, ccxt.RequestTimeout) or code in _AMBIGUOUS
-                ambiguous |= type(exc) is ccxt.NetworkError  # e.g. the connection dropped
-                # a bare 5xx page (proxy, load balancer) can follow an order that went in;
-                # ccxt words it '<id> <method> <url> <status> ...'
-                ambiguous |= isinstance(exc, ccxt.ExchangeNotAvailable) and bool(
-                    re.match(r"\S+ \S+ \S+ 5\d\d ", str(exc))
+                return send()
+            except Exception as exc:
+                unknown = OrderOutcomeUnknown(
+                    f"coinbase order {cid} may be resting on the book: cancel it under Open "
+                    f"orders on coinbase"
+                    if post_only
+                    else f"coinbase order {cid} may have been placed"
                 )
-                if attempt == 5:
+                err = _json_in(str(exc)) if isinstance(exc, ccxt.ExchangeError) else None
+                if isinstance(err, dict) and ("error_response" in err or "success" in err):
+                    if ambiguous:  # a refused resend says nothing about the earlier try
+                        raise unknown from exc
+                    return rejection(exc, err)
+                kind = _create_failure(exc)
+                ambiguous |= kind == "maybe"
+                if kind == "refused" or attempt == 5:
                     if ambiguous:
-                        raise OrderOutcomeUnknown(
-                            f"coinbase order {body['client_order_id']} may have been placed"
-                        ) from exc
+                        raise unknown from exc
                     raise
-                log.warning("coinbase order %s: %s; resending", body["client_order_id"], exc)
+                log.warning("coinbase order %s: %s; resending", cid, exc)
                 time.sleep(min(2.0**attempt, 8.0))  # 1, 2, 4, 8, 8 s: outlast a short outage
         raise RuntimeError("unreachable")
+
+    def _create_order(self, inst, order_side, amount, px, params, post_only) -> dict:
+        """Spot orders through ccxt, under our own client_order_id so that a create whose
+        reply was lost is resent rather than lost (see _resend). A rejection is raised as
+        ccxt raised it."""
+        cid = f"fc-{uuid.uuid4()}"
+        params = {**params, "client_order_id": cid}  # replaces ccxt's own random id
+
+        def rejected(exc, err):
+            raise exc
+
+        return self._resend(
+            lambda: self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params),
+            cid,
+            rejection=rejected,
+            post_only=post_only,
+        )
 
     def _retry(self, fn, what: str, tries: int = 5):
         """As CcxtVenue._retry, also for Coinbase's transient gateway errors, which ccxt

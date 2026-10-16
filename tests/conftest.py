@@ -93,3 +93,27 @@ def clock():
             self.ms += int(hours * HOUR + minutes * 60_000)
 
     return Clock()
+
+
+def ccxt_reply_error(exchange_id: str, status: int = 0, body="", reason: str = "Error"):
+    """The exception real ccxt raises for this HTTP reply to an order POST (``body`` may be
+    a requests exception to raise instead, e.g. a read timeout). Only the HTTP session is
+    faked, so ccxt's own error mapping and wording run."""
+    import ccxt
+    import requests
+
+    ex = getattr(ccxt, exchange_id)()
+
+    def request(method, url, **kw):
+        if isinstance(body, Exception):
+            raise body
+        r = requests.Response()
+        r.status_code, r._content, r.reason, r.url = status, body.encode(), reason, url
+        return r
+
+    ex.session.request = request
+    try:
+        ex.fetch("https://api.example.com/orders", "POST", {}, "{}")
+    except ccxt.BaseError as exc:
+        return exc
+    raise AssertionError(f"ccxt raised nothing for {status} {body!r}")

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import ccxt
 import pytest
+import requests
+from conftest import spot
 
 from funding_capture.models import Instrument, Kind
 from funding_capture.venues.coinbase import CoinbaseVenue
@@ -449,3 +451,134 @@ def test_gateway_errors_are_retried_and_an_ambiguous_create_is_unknown(cb, monke
     api.v3PrivatePostBrokerageOrders = always("INVALID_ARGUMENT")
     with pytest.raises(ccxt.ExchangeError):
         v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+
+
+def _replies(api, *errors, then=None):
+    """Make order POSTs fail with these (real-ccxt) errors in turn, then go through."""
+    real, sent, left = api.v3PrivatePostBrokerageOrders, [], list(errors)
+
+    def post(body):
+        sent.append(body["client_order_id"])
+        if left:
+            raise left.pop(0)
+        return (then or real)(body)
+
+    api.v3PrivatePostBrokerageOrders = post
+    return sent
+
+
+def test_order_create_outcomes_from_real_ccxt_errors(cb, monkeypatch):
+    """Anything that doesn't say the order was refused may have placed it: it is resent
+    under the same client_order_id (Coinbase won't place it twice) and ends as unknown,
+    never as "not placed". Once a try may have placed it, a later refusal says nothing
+    about that try."""
+    from conftest import ccxt_reply_error as err
+
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr("funding_capture.venues.coinbase.time.sleep", lambda s: None)
+    v, insts = cb
+    shib, api = insts["SHP-20DEC30-CDE"], v.ex
+    real = api.v3PrivatePostBrokerageOrders
+    timeout = err("coinbase", 0, requests.exceptions.ReadTimeout("Read timed out"))
+    unknown_ = err("coinbase", 500, '{"error":"UNKNOWN","error_details":"context canceled"}')
+    cancelled = err("coinbase", 499, '{"error":"CANCELLED"}')
+
+    def buy():
+        return v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+
+    # gateway codes outside the old list, a v2 internal error, an unmapped status page
+    for e in (
+        unknown_,
+        cancelled,
+        err("coinbase", 500, '{"errors":[{"id":"internal_server_error","message":"x"}]}'),
+        err("coinbase", 524, "<html>A timeout occurred</html>"),
+        err("coinbase", 408, "Request Timeout"),
+    ):
+        api.v3PrivatePostBrokerageOrders = real
+        sent = _replies(api, *[e] * 6)
+        with pytest.raises(OrderOutcomeUnknown):
+            buy()
+        assert len(sent) == 6 and len(set(sent)) == 1
+        api.v3PrivatePostBrokerageOrders = real
+        sent = _replies(api, e)  # once, then the resend answers: carried on with
+        assert buy().qty == pytest.approx(10_000_000) and len(set(sent)) == 1
+
+    # an earlier try may have gone in: a later refusal or rejection is still unknown
+    for later in (
+        err("coinbase", 401, "Unauthorized"),
+        err("coinbase", 401, '{"error":"UNAUTHENTICATED","code":16}'),
+        err("coinbase", 400, '{"error":"INVALID_ARGUMENT","code":3}'),
+        err("coinbase", 200, '{"success":false,"error_response":{"error":"INSUFFICIENT_FUND"}}'),
+    ):
+        api.v3PrivatePostBrokerageOrders = real
+        sent = _replies(api, timeout, later)
+        with pytest.raises(OrderOutcomeUnknown):
+            buy()
+        assert len(sent) == 2
+
+    # refused on the first try: not placed, raised at once
+    for first, cls in (
+        (err("coinbase", 401, "Unauthorized"), ccxt.AuthenticationError),
+        (err("coinbase", 400, '{"error":"INVALID_ARGUMENT","code":3}'), ccxt.BadRequest),
+    ):
+        api.v3PrivatePostBrokerageOrders = real
+        sent = _replies(api, first)
+        with pytest.raises(cls) as raised:
+            buy()
+        assert not isinstance(raised.value, OrderOutcomeUnknown) and len(sent) == 1
+    # rate limits and a proxy's 4xx page never got through: resent, then raised as is
+    for busy in (
+        err("coinbase", 429, "Too Many Requests"),
+        err("coinbase", 429, '{"error":"rate_limit_exceeded","error_description":"slow down"}'),
+        err("coinbase", 403, "<html/>"),
+    ):
+        api.v3PrivatePostBrokerageOrders = real
+        sent = _replies(api, *[busy] * 6)
+        with pytest.raises(type(busy)):
+            buy()
+        assert len(sent) == 6
+    # a rejection on the first try is Coinbase's answer: read by the caller
+    api.v3PrivatePostBrokerageOrders = real
+    _replies(api, err("coinbase", 200, '{"success":false,"error_response":{"error":"X"}}'))
+    with pytest.raises(RuntimeError, match="rejected"):
+        buy()
+    # a post-only that may be resting says where to cancel it
+    api.v3PrivatePostBrokerageOrders = real
+    _replies(api, *[timeout] * 6)
+    with pytest.raises(OrderOutcomeUnknown, match="Open orders"):
+        v.place_post_only(shib, "buy", 10_000_000, 0.0000055)
+
+
+def test_spot_orders_are_resent_under_our_own_id(cb, monkeypatch):
+    """Spot goes through ccxt's create_order, which tags each call with a fresh random
+    id; ours replaces it, so a create whose reply was lost is resent, not lost."""
+    from conftest import ccxt_reply_error as err
+
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr("funding_capture.venues.coinbase.time.sleep", lambda s: None)
+    v, _ = cb
+    btc = spot("coinbase", "BTC", "USD")
+    timeout = err("coinbase", 0, requests.exceptions.ReadTimeout("Read timed out"))
+    sent, left = [], []
+
+    def create(symbol, type_, side, amount, price, params):
+        sent.append(params["client_order_id"])
+        if left:
+            raise left.pop(0)
+        return {"id": "s1", "status": "open", "filled": 0.0}
+
+    v.ex.create_order = create
+    left[:] = [timeout, timeout]
+    assert v._create_order(btc, "buy", 0.01, 60_000, {}, post_only=True)["id"] == "s1"
+    assert len(sent) == 3 and len(set(sent)) == 1 and sent[0].startswith("fc-")
+    sent.clear()
+    left[:] = [timeout] * 6
+    with pytest.raises(OrderOutcomeUnknown, match="Open orders"):
+        v._create_order(btc, "buy", 0.01, 60_000, {}, post_only=True)
+    rejection = err("coinbase", 200, '{"success":false,"error_response":{"error":"X"}}')
+    left[:] = [rejection]  # Coinbase's answer: raised as ccxt raised it, for the caller
+    with pytest.raises(ccxt.ExchangeError) as raised:
+        v._create_order(btc, "buy", 0.01, 60_000, {}, post_only=False)
+    assert raised.value is rejection

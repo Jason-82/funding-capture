@@ -6,6 +6,8 @@ precision handling runs for real while nothing touches the network.
 
 import ccxt
 import pytest
+import requests
+from conftest import ccxt_reply_error
 
 from funding_capture.models import Kind
 from funding_capture.venues.ccxt_venue import CcxtVenue, credentials_from_env
@@ -502,13 +504,71 @@ def test_kraken_lost_reply_never_assumes_the_order_is_gone(monkeypatch):
     v.ex.fetch_open_orders, reads["n"] = mixed, 0
     assert v._find_by_client_id(btc, "x") is None and reads["n"] == 5
 
-    # Kraken's own refusal (busy, rate limit) means the order was never taken: no lookup
+    # Kraken's own refusal (busy, rate limit, cancel-only market) means the order was never
+    # taken: no lookup. The errors are the ones real ccxt raises for Kraken's replies.
     v.ex.fetch_open_orders, reads["n"], cancels[:] = open_orders, 0, []
-    for refused in (
-        ccxt.ExchangeNotAvailable('kraken {"error":["EService:Busy"]}'),
-        ccxt.DDoSProtection('kraken {"error":["EAPI:Rate limit exceeded"]}'),
+    for code in (
+        "EService:Busy",
+        "EService:Unavailable",
+        "EAPI:Rate limit exceeded",
+        "EGeneral:Temporary lockout",
+        "EService:Market in cancel_only mode",
+        "EAPI:Invalid nonce",
     ):
-        sent["exc"] = refused
-        with pytest.raises(type(refused)):
+        sent["exc"] = ccxt_reply_error("kraken", 200, f'{{"error":["{code}"]}}')
+        with pytest.raises(type(sent["exc"])):
             v.place_post_only(btc, "buy", 0.01, 59_000)
     assert reads["n"] == 0 and not cancels
+
+
+def test_kraken_internal_error_on_create_is_looked_up_not_taken_as_refusal(monkeypatch):
+    """An internal error is the server failing partway through: the order may be in. It is
+    looked up by our id and carried on with when found (so its fill is hedged, not traded
+    back), and unknown when not."""
+    import funding_capture.venues.ccxt_venue as cv
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    sent, book = {}, []
+
+    def create(symbol, type_, side, amount, price, params):
+        sent["cid"] = params["clientOrderId"]
+        book.append({"id": "O7", "status": "closed", "filled": amount, "average": price})
+        raise sent["exc"]
+
+    v.ex.create_order = create
+    v.ex.fetch_open_orders = lambda *a: []
+    v.ex.fetch_closed_orders = lambda symbol, since, limit, params: [
+        o for o in book if params.get("clientOrderId") == sent["cid"]
+    ]
+    v.ex.fetch_order = lambda oid, symbol: book[-1]
+    for code in ("EGeneral:Internal error", "EDatabase:Internal error"):
+        sent["exc"] = ccxt_reply_error("kraken", 200, f'{{"error":["{code}"]}}')
+        assert v.place_ioc(btc, "buy", 0.01, 61_000).qty == pytest.approx(0.01)
+    v.ex.fetch_closed_orders = lambda *a: []  # not found: unknown, never "not placed"
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_ioc(btc, "buy", 0.01, 61_000)
+
+
+def test_lost_reply_where_the_order_cannot_be_looked_up_is_unknown(okx):
+    """A venue without our own order ids: a lost reply can't be checked, so it is unknown
+    (the executor then trades nothing back), not "not placed"."""
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    p = next(i for i in okx.load_instruments() if i.symbol == "BTC/USDT:USDT")
+    sent = {}
+
+    def create(*a, **kw):
+        raise sent["exc"]
+
+    okx.ex.create_order = create
+    sent["exc"] = ccxt_reply_error("okx", 0, requests.exceptions.ReadTimeout("Read timed out"))
+    with pytest.raises(OrderOutcomeUnknown, match="may have executed"):
+        okx.place_ioc(p, "buy", 0.01, 61_000)
+    with pytest.raises(OrderOutcomeUnknown, match="Open orders"):
+        okx.place_post_only(p, "buy", 0.01, 59_000)
+    sent["exc"] = ccxt.RateLimitExceeded("okx 429 Too Many Requests")  # refused: not placed
+    with pytest.raises(ccxt.RateLimitExceeded):
+        okx.place_ioc(p, "buy", 0.01, 61_000)
