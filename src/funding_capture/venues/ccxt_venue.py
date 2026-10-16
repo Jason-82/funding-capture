@@ -99,6 +99,12 @@ def merged_opt(exchange, key: str):
     return (getattr(exchange, "options", None) or {}).get(key)
 
 
+# ccxt order statuses after which an order can't fill any more. Anything else may still
+# fill, including a venue's own status that ccxt passes through unmapped (Coinbase's
+# PENDING, QUEUED, CANCEL_QUEUED, UNKNOWN_ORDER_STATUS)
+_FINAL = {"closed", "canceled", "cancelled", "expired", "rejected"}
+
+
 def _no_answer(exc: Exception) -> bool:
     """ccxt fell back to '<id> <METHOD> <url>' with nothing from the exchange in it: the
     reply was cut off or unreadable (a chunked reply that ended early, an HTTP status ccxt
@@ -447,7 +453,7 @@ class CcxtVenue(Venue):
             filled,
             float(avg) / inst.multiplier if avg else None,
             fee_usd,
-            order.get("status") == "open",
+            order.get("status") not in _FINAL,
         )
 
     def place_post_only(self, inst, order_side, qty, price, reduce_only=False) -> str | None:
@@ -600,17 +606,17 @@ class CcxtVenue(Venue):
                 except Exception as exc:
                     log.warning("%s: fetch_order %s failed: %s", self.name, oid, exc)
                     continue
-                if last.get("status") not in (None, "open"):
+                if last.get("status") in _FINAL:
                     return last
             return last
 
         order = read()
-        if order is not None and order.get("status") not in (None, "open"):
+        if order is not None and order.get("status") in _FINAL:
             return order
         with contextlib.suppress(Exception):  # the reads below say what happened
             self.ex.cancel_order(oid, inst.symbol)  # an IOC still "open" is pending: end it
         order = read()
-        if order is None or order.get("status") in (None, "open"):
+        if order is None or order.get("status") not in _FINAL:
             raise OrderOutcomeUnknown(f"{self.name}: IOC {oid} fill could not be confirmed")
         return order
 
@@ -642,7 +648,7 @@ class CcxtVenue(Venue):
             if "immediately match" in str(exc).lower():
                 return Fill(inst, order_side, 0.0, limit_price, 0.0, None)
             raise
-        if order.get("filled") is None or order.get("status") in (None, "open"):
+        if order.get("filled") is None or order.get("status") not in _FINAL:
             order = self._confirm_ioc(inst, str(order["id"]))
         filled = float(order.get("filled") or 0.0)
         avg = float(order.get("average") or order.get("price") or price)

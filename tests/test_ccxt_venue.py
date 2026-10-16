@@ -666,3 +666,57 @@ def test_kraken_order_reads_ride_out_a_cut_off_reply_and_a_failed_cancel(monkeyp
 
     v.ex.cancel_order = cancel
     assert v.place_ioc(btc, "buy", 0.1, 60_000).qty == pytest.approx(0.04)
+
+
+def test_statuses_ccxt_passes_through_are_not_taken_as_final(monkeypatch):
+    """ccxt passes Coinbase's PENDING, QUEUED, CANCEL_QUEUED and UNKNOWN_ORDER_STATUS
+    through unmapped. They can still fill: an IOC read as PENDING right after it was sent
+    is read again (not recorded as a zero fill and sent twice), a cancel answered with
+    CANCEL_QUEUED is read until final, and a resting order in QUEUED counts as open."""
+    import funding_capture.venues.ccxt_venue as cv
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    ex = ccxt.coinbase()
+    m = _market("BTC/USD", "BTC", "spot", amount_step=0.00000001)
+    m.update(quote="USD", id="BTC-USD", quoteId="USD")
+    ex.set_markets([m])
+    v = CcxtVenue("coinbase", exchange=ex, quotes=("USD",), kinds=("spot",))
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+
+    def parsed(status, filled="0"):  # what ccxt makes of Coinbase's order reply
+        return ex.parse_order(
+            {
+                "order_id": "c1",
+                "product_id": "BTC-USD",
+                "side": "BUY",
+                "status": status,
+                "filled_size": filled,
+                "average_filled_price": "60000",
+                "total_fees": "0.6",
+            }
+        )
+
+    assert parsed("PENDING")["status"] == "PENDING"  # (unmapped by ccxt)
+    cancels = []
+    ex.cancel_order = lambda oid, symbol: cancels.append(oid)
+    ex.create_order = lambda *a, **k: ex.parse_order({"order_id": "c1"})  # id only
+    for early in ("PENDING", "QUEUED", "UNKNOWN_ORDER_STATUS"):
+        replies = iter([parsed(early), parsed("FILLED", "0.01")])
+        ex.fetch_order = lambda oid, symbol, replies=replies: next(replies)
+        assert v.place_ioc(btc, "buy", 0.01, 60_100).qty == pytest.approx(0.01)
+    assert not cancels  # it finished on its own: read again, not cancelled
+    replies = iter([parsed("PENDING")] * 6 + [parsed("FILLED", "0.01")])
+    ex.fetch_order = lambda oid, symbol: next(replies)
+    assert v.place_ioc(btc, "buy", 0.01, 60_100).qty == pytest.approx(0.01)
+    assert cancels == ["c1"]  # still pending after every read: ended, then read
+    # a create reply that already says PENDING (with 0 filled) is confirmed too
+    ex.create_order = lambda *a, **k: parsed("PENDING")
+    ex.fetch_order = lambda oid, symbol: parsed("FILLED", "0.01")
+    assert v.place_ioc(btc, "buy", 0.01, 60_100).qty == pytest.approx(0.01)
+
+    replies = iter([parsed("CANCEL_QUEUED"), parsed("CANCELLED", "0.004")])
+    ex.fetch_order = lambda oid, symbol: next(replies)
+    st = v.cancel_order(btc, "c1")
+    assert st.filled == pytest.approx(0.004) and not st.is_open
+    ex.fetch_order = lambda oid, symbol: parsed("QUEUED")
+    assert v.fetch_order_state(btc, "c1").is_open
