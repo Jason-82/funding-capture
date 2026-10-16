@@ -100,19 +100,30 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`107 passed`** (the number may be higher after updates)
+* `pytest -q` should end with **`117 passed`** (the number may be higher after updates)
   and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate
 it. Save that as the command `bot`:
 
 ```
-$ echo "alias bot='cd ~/funding-capture && source .venv/Scripts/activate'" >> ~/.bashrc
+$ echo "alias bot='cd ~/funding-capture && source .venv/Scripts/activate && stty -ixon'" >> ~/.bashrc
 ```
 
 From now on, **type `bot` first in every new Git Bash window.** (The first new window may
 print `WARNING: Found ~/.bashrc but no ~/.bash_profile …` and fix that itself. That's
-fine.)
+fine. The `stty -ixon` part stops Ctrl + S from freezing the window.)
+
+**If a new window says `bash: bot: command not found`**, run these two lines, then close
+and reopen Git Bash:
+
+```
+$ [ -e ~/.bash_profile ] || echo 'test -f ~/.profile && . ~/.profile' >> ~/.bash_profile
+$ grep -qs bashrc ~/.bash_profile || echo 'test -f ~/.bashrc && . ~/.bashrc' >> ~/.bash_profile
+```
+
+If it still fails, run `grep "alias bot" ~/.bashrc`; only if that prints nothing, run
+the `echo "alias bot=…"` line above again.
 
 ### Step 4. Create your settings file
 
@@ -254,10 +265,10 @@ $ grep "^20" logs/record.log | tail -n 1          # time at the start: within 10
 $ grep -ciE "critical|error|halted" logs/paper.log    # ideally 0
 ```
 
-`status` starts with `last update: 0 min ago` (or 1, 2). If it prints `WARNING: no
-update for … min`, the paper engine has stopped: start it again as in step 7. The
-recorder line starts with the date and time; if that is more than 10 minutes old,
-restart the recorder as in step 7.
+The second line of `status` says `engine: running, last saved 0 min ago` (or 1, 2). If
+it says `WARNING: the paper engine is NOT running`, start it again as in step 7. The
+recorder line starts with the date and time; if that is more than 15 minutes old, close
+the RECORD window (✕ is fine for the recorder) and start it again as in step 7.
 
 `status` then shows open pairs (coin, venues, size, funding earned, fees), closed pairs
 with their net result, and once a day has passed:
@@ -373,6 +384,10 @@ Only after a "go". Still no money moves in this phase.
    $ rm ~/Downloads/cdp_api_key.json
    ```
 
+   If your file had a different name, use that same quoted name, e.g.
+   `rm "$HOME/Downloads/cdp_api_key (1).json"`. Then `ls ~/Downloads/*.json` should no
+   longer list it.
+
 ### 3c. Kraken: create the API key
 
 1. On kraken.com, sign in, click your profile icon → **Settings** → **API** (Kraken Pro:
@@ -472,7 +487,7 @@ the bot refuses duplicate sections):
 ```yaml
 mode: live                      # was: paper
 portfolio:
-  capital_usd: 1600             # was: 5000 (what you actually deposited)
+  capital_usd: 1500             # was: 5000 (a bit under the $1,600 deposited: fees)
   max_positions: 1              # was: 4
   max_position_usd: 600         # was: 1000
 ```
@@ -504,8 +519,12 @@ $ fcap -c config.yaml check
 ### 4c. Start it
 
 First, stop Windows from restarting the PC by itself while real money is in play:
-**Settings → Windows Update → Pause updates** (pick the longest period). Install updates
-yourself after stopping the bot with QUIT (see "Stopping" below), then start it again.
+**Settings → Windows Update** (Windows 10: **Settings → Update & Security → Windows
+Update**) → **Pause updates**, longest period. Windows then shows the date the pause
+ends; it can't be paused for more than about 5 weeks. Also set **Advanced options →
+Active hours** to cover as much of the day as it allows. Before the pause ends, update by
+hand: stop the bot with QUIT (see "Stopping" below), install the updates and restart,
+start LIVE again (here, 4c), then RECORD and PAPER (step 7), and pause again.
 
 Open a new Git Bash window:
 
@@ -543,9 +562,11 @@ If anything doesn't match, stop the bot (see below) and paste
 ### 4e. Scale up slowly
 
 After a couple of clean round trips, raise `max_positions` (2, then 4) and
-`max_position_usd`, and keep `capital_usd` equal to what you actually deposited. Kraken
-pays for all the coins and Coinbase holds the margin for all the shorts, so keep each
-exchange at about half of `capital_usd` and add money to both when you raise it.
+`max_position_usd`. Set `capital_usd` to about 95% of what you deposited in total, and
+keep each exchange at a bit more than half of `capital_usd`: Kraken pays for all the
+coins plus their fees, Coinbase holds the margin for all the shorts. Add money to both
+when you raise it. (If Kraken runs short of USD, the next buy is rejected and the bot
+halts entries.)
 Restart the live engine after each change: in a **new** Git Bash window `bot` and
 `touch state/live/QUIT`, wait for the `$` prompt in the LIVE window, then click the LIVE
 window, ↑, Enter.
@@ -559,11 +580,12 @@ the bot has stopped).
 | You want to | Do this |
 |---|---|
 | pause new trades (keep managing open ones) | `touch state/live/STOP` (resume: `rm state/live/STOP`) |
-| close everything now | `touch state/live/FLATTEN` (trade again later: `rm state/live/FLATTEN`) |
+| close everything now | `touch state/live/FLATTEN` (trade again later: `rm state/live/FLATTEN`). If `logs/live.log` keeps showing `did not close; next try in 10 min` for a pair, `rm state/live/FLATTEN`, stop the bot with QUIT and close both legs of that pair by hand |
+| stop for good (close everything, then exit) | `touch state/live/FLATTEN` and `touch state/live/QUIT`. The bot closes every pair first (QUIT waits for that), then exits. When the LIVE window shows the `$` prompt, check both exchanges show no position, then `rm state/live/FLATTEN` |
 | stop the program | `touch state/live/QUIT`, then wait until the LIVE window shows the `$` prompt. That is usually within a minute, but can take several minutes while it is opening or closing a pair, because it never stops halfway through an order. Only then close the window. Open pairs stay open and are managed again when you restart |
 | restart the PC (e.g. to install updates) | `touch state/live/QUIT`, wait for the `$` prompt in the LIVE window, restart, then start LIVE again (4c), then RECORD and PAPER (step 7) |
 | the PC restarted by itself (power cut, crash, update), or the LIVE window is gone | this is an unclean stop: do the checks below, then start LIVE again (4c), then RECORD and PAPER (step 7) |
-| `status --live`, the LIVE window or `logs/live.log` shows `ENTRIES HALTED:` with any reason other than `STOP file present`, `FLATTEN file present` or `stale market data` | the bot hit something it won't guess about (e.g. an order it couldn't confirm). Stop it with QUIT, do the checks below, fix by hand, restart |
+| `status --live`, the LIVE window or `logs/live.log` shows `ENTRIES HALTED:` with any reason other than `STOP file present`, `FLATTEN file present` or `stale market data` | the bot hit something it won't guess about (an order it couldn't confirm, a leg left over, or `untracked position on …`: a Coinbase position no pair accounts for). It keeps managing open pairs but opens none. Stop it with QUIT, do the checks below, fix by hand, restart. If the reason mentions a network error or timeout, first wait until `fcap -c config.yaml check` passes for both exchanges |
 | `fcap … live` says `another engine is already running` | a LIVE window is still open (hover over the Git Bash icon in the taskbar). Use that one; never run two |
 
 **Don't stop the live bot with Ctrl + C or the window's ✕.** In Git Bash both kill it
@@ -574,15 +596,18 @@ starting it again:
 1. On Kraken and on Coinbase, open the **Open orders** list and **Cancel** every order
    there. The bot never leaves an order open when it stops normally, so any open order
    is a leftover, and it could still fill.
-2. **Coinbase → Futures → Positions:** each short must match a pair that
-   `fcap -c config.yaml status --live` lists for that coin, with the same qty. Close any
-   other short by hand.
+2. **Coinbase → Futures → Positions:** each short must belong to a pair that
+   `fcap -c config.yaml status --live` lists for that coin (item 4 covers one whose size
+   differs). Close any short in a coin that status doesn't list. (If you miss one, the
+   bot notices it and halts with `untracked position on …`.)
 3. **Kraken (and Coinbase spot):** a coin the bot doesn't list, and that you didn't own
    before, is a leftover: sell it.
 4. If `status --live` lists a pair whose coins or short are partly or fully gone, leave
-   it: on restart the bot sees the mismatch and closes what is left (log line
-   `FLATTENED`). If you also hold that coin yourself on that exchange, paste the details
-   to Claude first.
+   it: on restart the bot compares what is held with its record. If a leg is mostly gone
+   it closes what is left (log line `FLATTENED`); if the legs differ a little it trims
+   the larger one (note `rebalanced`); if both are smaller by the same amount it shrinks
+   its record (note `resized to holdings`). If you also hold that coin yourself on that
+   exchange, paste the details to Claude first.
 
 ### Daily routine once live
 
@@ -593,9 +618,11 @@ $ fcap -c config.yaml check                        # Coinbase "margin buffer" li
 $ grep -iE "critical|error|halted|still open" logs/live.log | tail
 ```
 
-* `status --live` must say `last update: 0 min ago` (or a few minutes). If it prints
-  `WARNING: no update for … min`, the live bot is **not running** and nothing is
-  watching your open pairs: do the checks under "Stopping" and start it again (4c).
+* The second line of `status --live` must say `engine: running, last saved …`. If it
+  says `WARNING: the live engine is NOT running`, nothing is watching your open pairs:
+  do the checks under "Stopping" and start it again (4c). If it says `NOTE: it is
+  running but has not saved for a while`, leave the exchanges alone: the bot is busy
+  with an order or can't write its file (look for `cannot write` in the LIVE window).
 * If it shows `ENTRIES HALTED:`, see the table under "Stopping".
 * Margin buffer: the bot warns at 35% and closes pairs at 20%. Add USD to Coinbase well
   before that.
@@ -636,7 +663,7 @@ scaling up.
 | Symptom | Fix |
 |---|---|
 | `bash: fcap: command not found` | new window: type `bot` (or `cd ~/funding-capture && source .venv/Scripts/activate`) |
-| `bash: bot: command not found` | run these two lines, then close and reopen Git Bash:<br>`[ -e ~/.bash_profile ] \|\| echo 'test -f ~/.profile && . ~/.profile' >> ~/.bash_profile`<br>`grep -qs bashrc ~/.bash_profile \|\| echo 'test -f ~/.bashrc && . ~/.bashrc' >> ~/.bash_profile`<br>If it still fails, run `grep "alias bot" ~/.bashrc`; only if that prints nothing, run the `echo "alias bot=…"` line from step 3 again |
+| `bash: bot: command not found` | see "If a new window says `bash: bot: command not found`" in step 3 |
 | `bash: py: command not found` | Python isn't installed, or Git Bash was opened before installing it: close and reopen Git Bash; if it persists, install from the 3.12.10 link in step 1 with **Add python.exe to PATH** ticked |
 | `python` opens the Microsoft Store | use `py -3.12` (needed only before step 3); or turn off **Settings → Apps → Advanced app settings → App execution aliases → python.exe / python3.exe** |
 | `.venv/bin/activate: No such file or directory` | on Windows it's `.venv/Scripts/activate` |
@@ -648,17 +675,18 @@ scaling up.
 | `FAIL balance: AuthenticationError` | wrong key or missing permission. If you set an IP allowlist, empty it on the exchange and run `check` again (your IP changed, or your connection uses IPv6) |
 | Kraken `EAPI:Invalid nonce`, or Coinbase `401` | clock: **Settings → Time & language → Date & time → Sync now**. If it persists, the key was used by another program: make a new key just for the bot |
 | Coinbase order `403` / "onboarded users" | finish futures onboarding (3a) |
-| `cannot write …engine.json` (CRITICAL) | another program (Excel, an editor, a sync or backup tool) has the bot's state file open: close it. Until the file can be written the bot opens no new pairs and QUIT waits; it carries on normally once the file is free |
+| `cannot write …engine.json` (CRITICAL) | another program (Excel, an editor, a sync or backup tool) has the bot's state file open: close it. Until the file can be written the bot opens no new pairs, and a QUIT waits (`QUIT waits: … cannot be written`): the bot exits by itself as soon as it can write the file again |
 | `PermissionError … trades.csv` | the file is still open in Excel: close it there, then run the backtest again |
-| a long error mentioning `yaml` (`ScannerError`, `found character '\t'`, `mapping values are not allowed here`, `could not find expected ':'`) right after editing config.yaml | `notepad config.yaml` and look at the lines you changed: they must start with exactly as many spaces as the lines around them (never Tab), and have a space after each colon (`capital_usd: 1600`). Save, close, try again |
+| a long error mentioning `yaml` (`ScannerError`, `ParserError`, `expected <block end>`, `found character '\t'`, `mapping values are not allowed here`, `could not find expected ':'`), or `expected settings indented below it`, right after editing config.yaml | `notepad config.yaml` and look at the lines you changed: they must start with exactly as many spaces as the lines they belong with (never Tab), and have a space after each colon (`capital_usd: 1500`). Save, close, try again |
 | `another engine is already running on state/…` | that engine's window is still open (hover over the Git Bash icon in the taskbar): use it. Never run two |
-| `status` prints `WARNING: no update for … min` | that engine isn't running: start it again (paper: step 7; live: the checks under "Stopping", then 4c) |
-| `duplicate key 'portfolio'` | you pasted a second section into config.yaml: merge them into one |
+| `status` prints `WARNING: the … engine is NOT running` | start it again (paper: step 7; live: the checks under "Stopping", then 4c) |
+| `status` prints `NOTE: it is running but has not saved for a while` | it is busy with an order, or can't write its file: see the `cannot write` row. Don't touch the exchanges or start a second copy |
+| `duplicate key '…'` (e.g. `portfolio`, `venues`) | you pasted a second copy of a section into config.yaml: merge them into one |
 | `fees.kraken.spot_maker … fractions` | write `0.004`, not `0.4` or `0.4%` |
 | `found state/engine.json from an older version` | move it to `state/paper/` or `state/live/` as the message says |
 | `scan` never shows `*` | normal in quiet markets; check your `fees:` are right |
 | many `maker order … timed out` in the log | spot orders aren't filling: raise `execution.maker_timeout_s` a little, or that coin is too thin |
-| a window shows nothing new for a long time | run `fcap -c config.yaml status` (add `--live` for the live bot): if it prints `WARNING: no update…`, the program has stopped; start it again. If it refuses with `another engine is already running`, it is still alive: find its window |
+| a window shows nothing new for a long time | run `fcap -c config.yaml status` (add `--live` for the live bot). `NOT running`: start it again. `engine: running` with a recent save: the window is just paused; click in it and press **Ctrl + Q** |
 
 ## Command reference
 
