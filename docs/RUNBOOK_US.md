@@ -132,19 +132,20 @@ You should see something like this (numbers will differ):
 
 ```
 coinbase  (ccxt id: coinbase; credentials: none)
-  ok    markets: 22 perps, 350 spot markets
-  ok    funding: BTC +0.000004/1h, ETH +0.000011/1h, SOL +0.000020/1h
-  ok    quotes: BIP-20DEC30-CDE 108000/108005, …
+  ok    markets: 24 perps, 407 spot markets
+  ok    funding: BTC +0.000015/1h, ETH +0.000006/1h, ZEC +0.000034/1h
+  ok    quotes: BIP-20DEC30-CDE 81970/81980, ETP-20DEC30-CDE 2463/2464, …
   skip  account checks (no API credentials in the environment)
 kraken  (ccxt id: kraken; credentials: none)
-  ok    markets: 0 perps, 600 spot markets
-  ok    quotes: …
+  ok    markets: 0 perps, 633 spot markets
+  ok    quotes: 0G/USD 0.251/0.252, 1INCH/USD 0.0949/0.0951, 2Z/USD 0.03331/0.03332
   skip  account checks (no API credentials in the environment)
 ```
 
-* **About 20 perps on Coinbase** is the important part. `0 perps` means Coinbase
-  changed its product list: paste the output to Claude.
-* Funding like `+0.000020/1h` is per hour: × 8,760 ≈ 17.5% a year.
+* **About 24 perps on Coinbase** is the important part (these are the US ones, with
+  ids ending in `-CDE`). `0 perps` means Coinbase changed its product list: paste the
+  output to Claude.
+* Funding like `+0.000015/1h` is per hour: × 8,760 ≈ 13% a year.
 * Any `FAIL` line: retry once; if it persists, paste it to Claude.
 
 ### Step 6. See what's available right now
@@ -186,20 +187,18 @@ Minimise it, but don't close it: closing the window stops the program.
 
    ```
    $ bot
-   $ printf '\e]0;RECORD\a'
-   $ fcap -c config.yaml --log-file logs/record.log record
+   $ printf '\e]0;RECORD\a'; fcap -c config.yaml --log-file logs/record.log record
    ```
 
-   The `printf` line names the window **RECORD**, so you can tell the windows apart in
-   the taskbar. You should see `recorded 22 funding readings`, then another such line
+   The `printf …;` part names the window **RECORD** while the program runs, so you can
+   tell the windows apart in the taskbar. You should see `recorded 24 funding readings`, then another such line
    about every 10 minutes. Minimise the window.
 
 2. **Paper trading.** Open another new Git Bash window:
 
    ```
    $ bot
-   $ printf '\e]0;PAPER\a'
-   $ fcap -c config.yaml --log-file logs/paper.log paper
+   $ printf '\e]0;PAPER\a'; fcap -c config.yaml --log-file logs/paper.log paper
    ```
 
    You should see `bootstrapped: … instruments, … candidates, 0 open positions`, then
@@ -446,8 +445,7 @@ Open a new Git Bash window:
 
 ```
 $ bot
-$ printf '\e]0;LIVE\a'
-$ fcap -c config.yaml --log-file logs/live.log live --i-understand-this-trades-real-money
+$ printf '\e]0;LIVE\a'; fcap -c config.yaml --log-file logs/live.log live --i-understand-this-trades-real-money
 ```
 
 Minimise the window; never close it while the bot runs (see "Stopping" below). It opens
@@ -518,7 +516,7 @@ $ grep -iE "critical|error|halted|still open" logs/live.log | tail
 
 | Venue | What the bot uses it for | Status for a US person |
 |---|---|---|
-| **Coinbase** (Advanced) | spot long legs **and** the short perp leg: CFTC-regulated perpetual-style futures on ~20 coins (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX, LTC, DOT, XLM, HBAR, SUI, BCH, NEAR, AAVE, ONDO, ENA, ZEC, 1000SHIB, 1000PEPE), hourly funding | ✅ after futures onboarding |
+| **Coinbase** (Advanced) | spot long legs **and** the short perp leg: CFTC-regulated perpetual-style futures on 24 coins (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX, LTC, DOT, XLM, HBAR, SUI, BCH, BNB, NEAR, AAVE, ONDO, ENA, HYPE, ZEC, PAXG, 1000SHIB, 1000PEPE as of October 2026), hourly funding | ✅ after futures onboarding |
 | **Kraken Pro** | spot long legs (many alts) | ✅ spot. Not available in NY or ME; no crypto withdrawals from IN |
 | Kraken US perps (Bitnomial) | – | exist, but no retail API |
 | Kalshi | – | lists a few perps since 2026, but no library support and invite-only API access |

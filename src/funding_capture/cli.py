@@ -96,7 +96,7 @@ def _check_venue(venue, has_creds: bool, step) -> None:
             "quotes",
             lambda: venue.fetch_quotes(sample),
             lambda r: ", ".join(
-                f"{k.split(':', 1)[1]} {q.bid:.6g}/{q.ask:.6g}" for k, q in r.items()
+                f"{k.split(':', 1)[1]} {q.bid:.10g}/{q.ask:.10g}" for k, q in r.items()
             ),
         )
     if not has_creds:
