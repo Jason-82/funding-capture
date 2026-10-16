@@ -327,7 +327,9 @@ def cmd_keys(args, settings: Settings) -> None:
             sys.exit("nothing entered; .env unchanged")
         values = {f"{prefix}_API_KEY": key, f"{prefix}_SECRET": secret}
     _write_env(args.env_file, values)
-    print(f"saved {', '.join(values)} to {args.env_file} (permissions: owner only)")
+    # Windows has no owner-only mode bits; the files rely on the user profile's ACL there
+    where = "" if os.name == "nt" else " (permissions: owner only)"
+    print(f"saved {', '.join(values)} to {args.env_file}{where}")
     print("next: fcap -c config.yaml check")
 
 

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash  # Git Bash on Windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: pytest -q
+
+  # The Windows runbook (docs/RUNBOOK_US.md) step by step in Git Bash, against live
+  # public market data. No API keys: nothing here can place an order.
+  windows-runbook:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (runbook step 2)
+        run: |
+          py -0p || true
+          py -3.12 -m venv .venv
+          source .venv/Scripts/activate
+          which python fcap || true
+          pip install -e ".[dev]"
+          pytest -q
+      - name: Config and check (runbook steps 3-4)
+        run: |
+          source .venv/Scripts/activate
+          cp config.us.yaml config.yaml
+          mkdir -p logs
+          fcap -c config.yaml check
+      - name: Markets and scan (runbook step 5)
+        run: |
+          source .venv/Scripts/activate
+          fcap -c config.yaml markets --venue coinbase --kind perp > logs/markets.txt
+          head -40 logs/markets.txt
+          wc -l logs/markets.txt
+          fcap -c config.yaml markets --venue kraken --kind spot > logs/kraken.txt
+          wc -l logs/kraken.txt
+          fcap -c config.yaml scan --top 30
+          fcap -c config.yaml scan --all --top 30
+      - name: Record and paper (runbook step 6)
+        run: |
+          source .venv/Scripts/activate
+          fcap -c config.yaml record --once
+          ls -R data | head -40
+          fcap -c config.yaml --log-file logs/paper.log paper --steps 3
+          fcap -c config.yaml status
+          grep -c . logs/paper.log
+          touch state/paper/STOP
+          fcap -c config.yaml --log-file logs/paper.log paper --steps 1
+          tail -20 logs/paper.log
+      - name: Keys command in Git Bash (fake keys, separate env file)
+        run: |
+          source .venv/Scripts/activate
+          printf 'fake-key\nfake-secret\n' | fcap --env-file logs/test.env keys kraken
+          grep -c '^KRAKEN_' logs/test.env
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runbook-logs
+          path: logs/
