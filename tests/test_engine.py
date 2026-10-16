@@ -147,6 +147,13 @@ def test_stop_file_blocks_entries_and_flatten_closes(tmp_path, clock):
     assert w.engine.entries_halted
 
 
+def test_quit_file_ends_run_between_steps(tmp_path, clock):
+    w = World(tmp_path, clock)
+    (tmp_path / "QUIT").touch()
+    w.engine.run()  # no step limit: only the QUIT file ends it
+    assert not (tmp_path / "QUIT").exists()  # removed, so the next start runs normally
+
+
 def test_stale_venue_halts_entries(tmp_path, clock):
     w = World(tmp_path, clock)
     w.db.fail = True

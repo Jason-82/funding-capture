@@ -1,13 +1,19 @@
-# Runbook: funding-capture from the US, step by step
+# Runbook: funding-capture from the US, on Windows with Git Bash
 
-Everything runs **on your own computer** (or a small always-on server). The cloud
-sandbox this was built in can't reach exchanges, so the bot has not yet talked to a real
-exchange. The plan below finds problems with no money at risk first.
+Everything runs **on your own Windows PC in Git Bash**. The plan below finds problems
+with no money at risk first. The Phase 1 commands are also run automatically on a
+Windows machine in Git Bash against the real Coinbase and Kraken APIs (the
+`windows-runbook` job in `.github/workflows/ci.yml`).
 
-**How to read this:** lines starting with `$` are commands. Type or paste them into
-Terminal **without** the `$`, then press Enter. "You should see" describes the expected
-output. If you see something else, copy the whole Terminal output into the Claude chat
-and ask what to do.
+**How to read this**
+
+* Lines starting with `$` are commands. Type or paste them into Git Bash **without** the
+  `$`, then press Enter.
+* **Pasting into Git Bash:** **Shift + Insert**, or right-click → **Paste**. Ctrl + V
+  usually does nothing there.
+* **Copying out of Git Bash:** select the text with the mouse. That copies it.
+* "You should see" describes the expected output. If you see something else, copy the
+  whole output into the Claude chat and ask what to do.
 
 **The plan at a glance**
 
@@ -28,83 +34,84 @@ like.
 
 ## Phase 1: today
 
-### Step 1. Open Terminal
+### Step 1. Install the tools (once)
 
-macOS: press **⌘ + Space**, type `Terminal`, press Enter. Keep this window open for
-the rest of Phase 1.
+1. **Git Bash.** If it's in your Start menu, skip this. Otherwise download **Git for
+   Windows** from <https://git-scm.com/download/win>, run the installer and accept every
+   default. The defaults include Git Credential Manager, which step 2 uses to sign in to
+   GitHub.
 
-*Windows:* first install WSL. Open **PowerShell as Administrator**, run `wsl --install`,
-restart, then open the **Ubuntu** app from the Start menu. Use the Ubuntu window as your
-Terminal. Everywhere below, run `sudo apt update && sudo apt install -y python3.12
-python3.12-venv git tmux gh` instead of the `brew` lines.
+2. Open **Git Bash**: press the **Windows key**, type `Git Bash`, press Enter.
 
-### Step 2. Install the tools (once)
-
-1. Install Homebrew (the macOS package manager), if `brew --version` says "command not
-   found":
+3. **Python 3.12.** In Git Bash:
 
    ```
-   $ /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   $ winget install -e --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
    ```
 
-   It asks for your Mac password (nothing shows while typing; that's normal). When it
-   finishes it prints **"Next steps"** with two `echo …` / `eval …` lines: copy and run
-   those two lines.
+   Click **Yes** if Windows asks whether the installer may make changes. If you get
+   `winget: command not found`, use the website instead: on
+   <https://www.python.org/downloads/windows/> download the **Windows installer
+   (64-bit)** of the latest 3.12 release, run it, tick **Add python.exe to PATH** on the
+   first screen, then **Install Now**.
 
-2. Install Python 3.12, GitHub's command-line tool, and tmux (keeps programs running
-   after you close the window):
-
-   ```
-   $ brew install python@3.12 gh tmux
-   ```
-
-3. Check:
+4. **Close Git Bash and open a new one** so it sees the new program. Check:
 
    ```
-   $ python3.12 --version
+   $ py -3.12 --version
    ```
 
-   You should see `Python 3.12.x`.
+   You should see `Python 3.12.x`. Type `py -3.12` as written, not `python`: until
+   step 3 is done, `python` on Windows may open the Microsoft Store instead.
 
-### Step 3. Download the code
+5. **Set the clock to sync automatically.** Exchanges reject requests from a PC whose
+   clock is off. Open **Settings → Time & language → Date & time**, turn on **Set time
+   automatically**, then click **Sync now**.
 
-1. Log in to GitHub (the repository is yours and may be private):
-
-   ```
-   $ gh auth login
-   ```
-
-   Choose: **GitHub.com** → **HTTPS** → **Yes** (authenticate Git) → **Login with a web
-   browser**. Copy the one-time code it shows, press Enter, paste the code in the
-   browser page and approve.
-
-2. Download the project into your home folder and switch to the branch with this work:
-
-   ```
-   $ cd ~
-   $ gh repo clone Jason-82/funding-capture
-   $ cd funding-capture
-   $ git checkout claude/busy-maxwell-hiuy46
-   ```
-
-   You should see `Switched to a new branch 'claude/busy-maxwell-hiuy46'`.
-
-### Step 4. Install the bot
+### Step 2. Download the code
 
 ```
-$ python3.12 -m venv .venv
-$ source .venv/bin/activate
+$ cd ~
+$ git clone https://github.com/Jason-82/funding-capture.git
+$ cd funding-capture
+$ git checkout claude/busy-maxwell-hiuy46
+```
+
+* At the `git clone` line a **Connect to GitHub** window may open (the repository may
+  be private). Choose **Sign in with your browser**, approve in the browser, and the
+  download continues.
+* `~` is your Windows user folder, so the project lands in
+  `C:\Users\<you>\funding-capture`. Leave it there: don't move it into OneDrive,
+  Dropbox or another synced folder (it will hold your API keys).
+* The last line should say `Switched to a new branch 'claude/busy-maxwell-hiuy46'`.
+
+### Step 3. Install the bot
+
+```
+$ py -3.12 -m venv .venv
+$ source .venv/Scripts/activate
 $ pip install -e ".[dev]"
 $ pytest -q
 ```
 
-* After `source …` your prompt starts with `(.venv)`. **Every time you open a new
-  Terminal window for this project, run these two lines first:**
-  `cd ~/funding-capture` and `source .venv/bin/activate`.
-* `pip install` prints a lot and ends with `Successfully installed …`.
-* `pytest -q` should end with **`96 passed`** (the number may be higher after updates).
+* After `source …` your prompt shows `(.venv)`. On Windows the folder is `Scripts`,
+  not `bin`.
+* `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
+  new pip release is available is harmless.
+* `pytest -q` should end with **`98 passed`** (the number may be higher after updates).
 
-### Step 5. Create your settings file
+**Make a shortcut.** Every new Git Bash window has to switch to the project and activate
+it. Save that as the command `bot`:
+
+```
+$ echo "alias bot='cd ~/funding-capture && source .venv/Scripts/activate'" >> ~/.bashrc
+```
+
+From now on, **type `bot` first in every new Git Bash window.** (The first new window may
+print `WARNING: Found ~/.bashrc but no ~/.bash_profile …` and fix that itself. That's
+fine.)
+
+### Step 4. Create your settings file
 
 ```
 $ cp config.us.yaml config.yaml
@@ -112,8 +119,10 @@ $ mkdir -p logs
 ```
 
 You don't need to change anything yet. `config.yaml` is yours (git never uploads it).
+When you do need to edit it later: `notepad config.yaml`, change it, **Ctrl + S**,
+close Notepad. Notepad is fine; the bot copes with the way it saves files.
 
-### Step 6. Check that both exchanges answer (no keys needed)
+### Step 5. Check that both exchanges answer (no keys needed)
 
 ```
 $ fcap -c config.yaml check
@@ -138,7 +147,9 @@ kraken  (ccxt id: kraken; credentials: none)
 * Funding like `+0.000020/1h` is per hour: × 8,760 ≈ 17.5% a year.
 * Any `FAIL` line: retry once; if it persists, paste it to Claude.
 
-### Step 7. See what's available right now
+### Step 6. See what's available right now
+
+Maximise the Git Bash window first; the tables are wide.
 
 ```
 $ fcap -c config.yaml markets --venue coinbase --kind perp
@@ -162,50 +173,55 @@ one contract is, and what one contract is worth in dollars.
 Don't worry if nothing has a `*`; funding moves with the market. This is just to get a
 feel for it.
 
-### Step 8. Start recording funding and paper trading (leave them running)
+### Step 7. Start recording funding and paper trading (leave them running)
 
 Coinbase doesn't publish funding history through its API, so the bot records it from
 now on. At the same time it paper trades: real prices, real funding, **simulated**
 orders. No keys, no money.
 
-1. Start the recorder in its own background session:
+Each of the two programs runs in **its own Git Bash window, which you leave open**.
+Minimise it, but don't close it: closing the window stops the program.
+
+1. **Recorder.** Open a new Git Bash window (Windows key → `Git Bash`), then:
 
    ```
-   $ tmux new -s record
-   ```
-
-   The window clears (you're now "inside" tmux). Run:
-
-   ```
-   $ cd ~/funding-capture && source .venv/bin/activate
+   $ bot
+   $ printf '\e]0;RECORD\a'
    $ fcap -c config.yaml --log-file logs/record.log record
    ```
 
-   You should see `recorded 22 funding readings` (about every 10 minutes). Now
-   **detach**: press **Ctrl + b**, let go, then press **d**. You're back in your normal
-   window and the recorder keeps running.
+   The `printf` line names the window **RECORD**, so you can tell the windows apart in
+   the taskbar. You should see `recorded 22 funding readings`, then another such line
+   about every 10 minutes. Minimise the window.
 
-2. Start paper trading the same way:
+2. **Paper trading.** Open another new Git Bash window:
 
    ```
-   $ tmux new -s paper
-   $ cd ~/funding-capture && source .venv/bin/activate
+   $ bot
+   $ printf '\e]0;PAPER\a'
    $ fcap -c config.yaml --log-file logs/paper.log paper
    ```
 
    You should see `bootstrapped: … instruments, … candidates, 0 open positions`, then
-   every minute a `best: spot_perp …` line and `open positions: …`. Detach with
-   **Ctrl + b**, then **d**.
+   every minute a `best: spot_perp …` line and `open positions: …`. Minimise the window.
 
-3. Keep the Mac awake while these run (plugged in, lid open):
+3. **Keep the PC awake while these run.**
+   * **Settings → System → Power & battery** (desktops: **Power**) → **Screen and
+     sleep** → set **"When plugged in, put my device to sleep after"** to **Never**. The
+     screen may still turn off; that's fine.
+   * Laptop: keep it plugged in. If you close the lid, first set **Control Panel →
+     Power Options → Choose what closing the lid does → When plugged in: Do nothing**.
+   * Windows Update may restart the PC overnight. **Settings → Windows Update →
+     Advanced options → Active hours** sets when it won't.
 
-   ```
-   $ tmux new -d -s awake 'caffeinate -dims'
-   ```
-
-To look at a session later: `tmux attach -t paper` (or `record`). Detach again with
-Ctrl + b, d. To list sessions: `tmux ls`. If you restart the Mac, repeat step 8. The bot
+**After a restart** (or if you closed a window by accident), repeat step 7. The bot
 picks up where it left off.
+
+**To stop the paper engine cleanly** (for example to change settings), in any Git Bash
+window type `bot`, then `touch state/paper/QUIT`. Within a minute the PAPER window
+prints `QUIT file found: exiting…` and returns to the `$` prompt. Avoid **Ctrl + C**:
+in Git Bash it kills the program instantly, in the middle of whatever it is doing. (The
+recorder doesn't matter: close its window any time.)
 
 **Phase 1 done.**
 
@@ -215,14 +231,18 @@ picks up where it left off.
 
 ### Every day (5 minutes)
 
-Open Terminal, then:
+Open Git Bash, then:
 
 ```
-$ cd ~/funding-capture && source .venv/bin/activate
-$ tmux ls                                    # should list: awake, paper, record
-$ fcap -c config.yaml status                 # paper positions and results
-$ grep -ciE "critical|error|halted" logs/paper.log   # ideally 0
+$ bot
+$ tail -n 2 logs/paper.log        # time on the last line: within the last 2 minutes
+$ tail -n 1 logs/record.log       # within the last 10 minutes
+$ fcap -c config.yaml status      # paper positions and results
+$ grep -ciE "critical|error|halted" logs/paper.log    # ideally 0
 ```
+
+The log lines start with the date and time as your PC shows it. If a log has stopped
+moving, that program isn't running: check its window, then restart it as in step 7.
 
 `status` shows open pairs (coin, venues, size, funding earned, fees), closed pairs with
 their net result, and once a day has passed:
@@ -232,19 +252,19 @@ running for 9.2 days on $5,000 of capital
 annualised return on capital so far: +12.4%  (noisy until a few weeks have passed)
 ```
 
-If `tmux ls` is missing `paper` or `record`, restart it as in step 8. If the error count
-grows, run `grep -iE "critical|error|halted" logs/paper.log | tail -20` and paste the
-output to Claude.
+If the error count grows, run `grep -iE "critical|error|halted" logs/paper.log | tail -20`
+and paste the output to Claude.
 
 ### After 2 weeks: first backtest on the recorded data
 
 ```
 $ fcap -c config.yaml backtest --trades trades.csv
+$ start trades.csv
 ```
 
 This replays the recorded funding with your settings. Read: `net pnl`, **`APR on
-capital`**, `funding / costs`, number of trades. `trades.csv` opens in Numbers or Excel.
-Two weeks is short, so treat it as a sanity check, not a verdict.
+capital`**, `funding / costs`, number of trades. `start trades.csv` opens the trade
+list in Excel. Two weeks is short, so treat it as a sanity check, not a verdict.
 
 ### After 4 weeks: tune and decide
 
@@ -254,9 +274,11 @@ $ fcap -c config.yaml sweep
 
 This tries many settings: it picks on the first half of the data and scores on the
 second half (`test_apr_pct`). Paste the output to Claude if you want help choosing.
-Change settings with `nano config.yaml`: arrow keys to move, edit, **Ctrl + O** then
-Enter to save, **Ctrl + X** to exit. The paper engine reads settings at start, so
-restart it (attach, **Ctrl + c**, run the `fcap … paper` line again, detach).
+
+To change a setting: `notepad config.yaml`, edit, Ctrl + S, close Notepad. The paper
+engine reads settings when it starts, so restart it: `touch state/paper/QUIT`, wait until
+the PAPER window shows the `$` prompt again, then in that window press **↑** (brings back
+the last command) and Enter.
 
 **Decision rule** (from `status` and the backtest):
 
@@ -299,16 +321,22 @@ Only after a "go". Still no money moves in this phase.
    * IP allowlist: the address from step 1. If your home IP changes often, you can leave
      this empty; the key still can't move money.
    * Advanced settings → signature algorithm: **ECDSA**
-4. Create. A file named like `cdp_api_key.json` downloads. Store it in the bot, then
-   delete the download:
+4. Create. A file named like `cdp_api_key.json` downloads to your **Downloads**
+   folder. Store it in the bot, then delete the download:
 
    ```
-   $ cd ~/funding-capture && source .venv/bin/activate
+   $ bot
+   $ ls ~/Downloads/*.json
    $ fcap keys coinbase --json ~/Downloads/cdp_api_key.json
    $ rm ~/Downloads/cdp_api_key.json
    ```
 
-   You should see `saved COINBASE_API_KEY, COINBASE_SECRET_FILE to .env`.
+   `ls` shows the exact file name. If your browser named it differently (for example
+   `cdp_api_key (1).json`), use that name in quotes in the next two lines:
+   `--json "$HOME/Downloads/cdp_api_key (1).json"`.
+
+   You should see `saved COINBASE_API_KEY, COINBASE_SECRET_FILE to .env`. The private
+   key itself goes to `C:\Users\<you>\.fcap\coinbase.pem`.
 
 ### 3c. Kraken: create the API key
 
@@ -328,8 +356,18 @@ Only after a "go". Still no money moves in this phase.
    $ fcap keys kraken
    ```
 
-   Paste the API key when asked, then the private key (it stays invisible while you
-   paste; that's normal), Enter after each.
+   Copy the API key from the Kraken page, paste it (Shift + Insert), Enter. Then the
+   private key, Enter. **Git Bash can't hide what you paste**, so the private key shows
+   on screen. As soon as you see `saved KRAKEN_API_KEY, KRAKEN_SECRET to .env`, wipe
+   the screen:
+
+   ```
+   $ clear
+   ```
+
+The keys now sit in `.env` in the project folder and in `C:\Users\<you>\.fcap`. Both
+are inside your Windows user folder, which other accounts on the PC can't read, and git
+never uploads them.
 
 ### 3d. Check the keys and set your real fees
 
@@ -343,25 +381,28 @@ Each venue now also shows `ok balance: …` and a fee line like:
   ok    your spot fee: spot_maker: 0.0040  spot_taker: 0.0080  (fractions; paste under fees: kraken:)
 ```
 
-Open the config and put those numbers in under `fees:` for that exchange:
+Open the config:
 
 ```
-$ nano config.yaml
+$ notepad config.yaml
 ```
+
+Find the `fees:` section and replace the `spot_taker` and `spot_maker` numbers for each
+exchange with the ones `check` printed for it. For example:
 
 ```yaml
 fees:
   coinbase:
-    spot_taker: 0.0090      # ← from the coinbase line
-    spot_maker: 0.0050      # ←
+    spot_taker: 0.0090      # from the coinbase line
+    spot_maker: 0.0050
     …
   kraken:
-    spot_taker: 0.0080      # ← from the kraken line
-    spot_maker: 0.0040      # ←
+    spot_taker: 0.0080      # from the kraken line
+    spot_maker: 0.0040
 ```
 
-Save (Ctrl + O, Enter) and exit (Ctrl + X). Then re-run `fcap -c config.yaml scan`,
-because your real fees change which pairs pass. Restart the paper engine so it uses
+Save (Ctrl + S) and close Notepad. Then re-run `fcap -c config.yaml scan`, because your
+real fees change which pairs pass. Restart the paper engine (see Phase 2) so it uses
 them too.
 
 ---
@@ -383,7 +424,7 @@ For the first trial the bot opens **one** pair of at most $600:
 ### 4b. Switch the config to live, sized to one contract
 
 ```
-$ nano config.yaml
+$ notepad config.yaml
 ```
 
 **Change these existing lines** (don't add a second `portfolio:` section; the bot
@@ -397,16 +438,21 @@ portfolio:
   max_position_usd: 600         # was: 1000
 ```
 
+Save and close Notepad.
+
 ### 4c. Start it
 
+Open a new Git Bash window:
+
 ```
-$ tmux new -s live
-$ cd ~/funding-capture && source .venv/bin/activate
+$ bot
+$ printf '\e]0;LIVE\a'
 $ fcap -c config.yaml --log-file logs/live.log live --i-understand-this-trades-real-money
 ```
 
-Detach (Ctrl + b, d). It opens a pair only when one passes your rules. That may take
-hours or days.
+Minimise the window; never close it while the bot runs (see "Stopping" below). It opens
+a pair only when one passes your rules. That may take hours or days. The paper engine
+can keep running alongside for comparison; it keeps separate records.
 
 ### 4d. Watch the first trade closely
 
@@ -422,31 +468,41 @@ When `fcap -c config.yaml status --live` shows an open pair:
 
 Let it close the pair by itself (when funding fades), or test closing with
 `touch state/live/FLATTEN` (it closes everything; `rm state/live/FLATTEN` lets it trade
-again). After
-the close, both exchanges should be back to no position and only fees + funding should
-have changed your balances.
+again). After the close, both exchanges should be back to no position and only fees +
+funding should have changed your balances.
 
-If anything doesn't match, stop (see below) and paste `fcap -c config.yaml status --live`
-plus `tail -50 logs/live.log` to Claude.
+If anything doesn't match, stop the bot (see below) and paste
+`fcap -c config.yaml status --live` plus `tail -n 50 logs/live.log` to Claude.
 
 ### 4e. Scale up slowly
 
 After a couple of clean round trips, raise `max_positions` (2, then 4) and
 `max_position_usd`, and keep `capital_usd` equal to what you actually deposited. Restart
-the live engine after each change.
+the live engine after each change (`touch state/live/QUIT`, wait for the `$` prompt in
+the LIVE window, ↑, Enter).
 
 ### Stopping, pausing, emergencies
+
+Run these from any Git Bash window after `bot`.
 
 | You want to | Do this |
 |---|---|
 | pause new trades (keep managing open ones) | `touch state/live/STOP` (resume: `rm state/live/STOP`) |
 | close everything now | `touch state/live/FLATTEN` |
-| stop the program | `touch state/live/STOP`, wait 2 minutes, `tmux attach -t live`, **Ctrl + c**. Open pairs stay open and are managed again when you restart |
+| stop the program | `touch state/live/QUIT`. It exits within a minute, between steps, never halfway through an order; then close the window. Open pairs stay open and are managed again when you restart |
+| restart the PC (e.g. Windows Update) | `touch state/live/QUIT` first, then restart, then start it again (4c) |
 | `status` says `ENTRIES HALTED` | the bot hit something it won't guess about (e.g. an order it couldn't confirm). Stop it, check open orders and positions on both exchanges, fix by hand, restart |
+
+**Don't stop the live bot with Ctrl + C or the window's ✕.** In Git Bash both kill it
+instantly. If that happens while it is opening a pair, one leg can be left on an
+exchange without the bot knowing about it. If it ever happens, compare both exchanges'
+positions and open orders with `fcap -c config.yaml status --live` and close anything
+the bot doesn't list, by hand, before restarting.
 
 ### Daily routine once live
 
 ```
+$ bot
 $ fcap -c config.yaml status --live
 $ fcap -c config.yaml check                        # Coinbase "margin buffer" line
 $ grep -iE "critical|error|halted|still open" logs/live.log | tail
@@ -490,17 +546,25 @@ scaling up.
 
 | Symptom | Fix |
 |---|---|
-| `command not found: fcap` | you're in a new window: `cd ~/funding-capture && source .venv/bin/activate` |
+| `bash: fcap: command not found` | new window: type `bot` (or `cd ~/funding-capture && source .venv/Scripts/activate`) |
+| `bash: bot: command not found` | run the `echo "alias bot=…"` line from step 3 once more, then close and reopen Git Bash |
+| `bash: py: command not found` | Python isn't installed, or Git Bash was opened before installing it: close and reopen Git Bash; if it persists, reinstall from python.org with **Add python.exe to PATH** ticked |
+| `python` opens the Microsoft Store | use `py -3.12` (needed only before step 3); or turn off **Settings → Apps → Advanced app settings → App execution aliases → python.exe / python3.exe** |
+| `.venv/bin/activate: No such file or directory` | on Windows it's `.venv/Scripts/activate` |
+| pasting does nothing | **Shift + Insert**, or right-click → Paste |
+| `git clone` asks for a username/password in the window | the sign-in window didn't appear: reinstall Git for Windows with the default options (they include Git Credential Manager) and clone again |
 | `FAIL markets: NetworkError` | internet, VPN or firewall, or the exchange is down: retry |
 | `FAIL credentials: COINBASE_SECRET_FILE: cannot read …` | re-run `fcap keys coinbase --json <file>` with a freshly created key |
 | `FAIL balance: AuthenticationError` | wrong key, missing permission, or your IP changed (update the allowlist) |
-| Kraken `EAPI:Invalid nonce` | the key was used by another program, or your clock is off: make a new key just for the bot |
+| Kraken `EAPI:Invalid nonce`, or Coinbase `401` | clock: **Settings → Time & language → Date & time → Sync now**. If it persists, the key was used by another program: make a new key just for the bot |
 | Coinbase order `403` / "onboarded users" | finish futures onboarding (3a) |
+| `PermissionError` naming `engine.json` | another program (Excel, an editor, a sync or backup tool) has the bot's state file open: close it. The bot retries for 2 seconds before giving up |
 | `duplicate key 'portfolio'` | you pasted a second section into config.yaml: merge them into one |
 | `fees.kraken.spot_maker … fractions` | write `0.004`, not `0.4` or `0.4%` |
 | `found state/engine.json from an older version` | move it to `state/paper/` or `state/live/` as the message says |
 | `scan` never shows `*` | normal in quiet markets; check your `fees:` are right |
 | many `maker order … timed out` in the log | spot orders aren't filling: raise `execution.maker_timeout_s` a little, or that coin is too thin |
+| a window shows nothing new for a long time | check the log (`tail -n 2 logs/paper.log`): if its last line is old too, the program died; start it again |
 
 ## Command reference
 
@@ -517,4 +581,17 @@ fcap -c config.yaml paper
 fcap -c config.yaml live --i-understand-this-trades-real-money
 fcap -c config.yaml status [--live]
 global options: -v (debug)  --log-file FILE  --env-file FILE (default .env)
+
+kill switches (paper engine: state/paper/, live engine: state/live/)
+touch state/live/STOP       no new pairs            rm state/live/STOP to resume
+touch state/live/FLATTEN    close all pairs         rm state/live/FLATTEN to trade again
+touch state/live/QUIT       exit the program cleanly (the file removes itself)
 ```
+
+## On a Mac or Linux instead
+
+The same steps work in Terminal with these changes: install Python 3.12 with your
+package manager and type `python3.12` where this says `py -3.12`; activate with
+`source .venv/bin/activate`; run the long-lived programs under `tmux` (or
+`nohup … &`) instead of in separate windows; keep a Mac awake with `caffeinate -dims`.
+There, `fcap keys` hides the private key while you paste it.

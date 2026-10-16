@@ -8,8 +8,9 @@ continuous risk monitoring.
 Start with [docs/STRATEGY.md](docs/STRATEGY.md). It covers the search space (which
 hedged constructions exist, the cost and capital arithmetic, the risks) and the plan for
 validating the idea before risking money. **In the US?** Follow
-[docs/RUNBOOK_US.md](docs/RUNBOOK_US.md): it walks through every step on your own
-machine and covers which venues US persons can actually trade.
+[docs/RUNBOOK_US.md](docs/RUNBOOK_US.md): it walks through every step on a Windows PC
+in Git Bash (with notes for Mac/Linux) and covers which venues US persons can
+actually trade.
 
 > **Status:** The data, backtest and paper paths are covered by offline tests. The live
 > order path is written against ccxt's unified API but has **never been run against a
@@ -19,6 +20,7 @@ machine and covers which venues US persons can actually trade.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
+# Windows (Git Bash): py -3.12 -m venv .venv && source .venv/Scripts/activate
 pip install -e ".[dev]"
 cp config.example.yaml config.yaml   # edit venues, fees, sizing
 ```
@@ -61,7 +63,9 @@ fcap -c config.yaml live --i-understand-this-trades-real-money
 Paper and live keep separate state in `state/paper/` and `state/live/` (older versions
 used `state/engine.json`; the engine refuses to start until you move that file). Kill switches
 while the engine runs: `touch state/<mode>/STOP` blocks new entries;
-`touch state/<mode>/FLATTEN` closes every pair and stops opening new ones.
+`touch state/<mode>/FLATTEN` closes every pair and stops opening new ones;
+`touch state/<mode>/QUIT` ends the program between steps (open pairs stay open and are
+picked up on restart). Use QUIT rather than Ctrl+C in Git Bash on Windows.
 
 Legs on venues listed in `costs.maker_venues` are worked with post-only orders (rest at
 the touch, hedge each fill immediately on the other leg). That matters on venues where

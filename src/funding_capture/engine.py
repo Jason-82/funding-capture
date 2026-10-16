@@ -2,7 +2,9 @@
 
 Runs identically against ``PaperVenue`` (simulated fills on live data) and ``CcxtVenue``
 (real orders). Kill switches: create ``<state_dir>/STOP`` to block new entries, or
-``<state_dir>/FLATTEN`` to close everything and stop opening.
+``<state_dir>/FLATTEN`` to close everything and stop opening. ``<state_dir>/QUIT`` ends
+the program between steps (open pairs stay open), which is the clean way to stop it
+where Ctrl+C kills the process outright (Git Bash on Windows).
 """
 
 from __future__ import annotations
@@ -160,7 +162,25 @@ class Engine:
             except Exception:
                 log.exception("step failed; continuing")
             n += 1
-            time.sleep(max(0.0, self.cfg.loop_seconds - (self.clock() - started)))
+            if max_steps is not None and n >= max_steps:
+                return
+            if self._wait_or_quit(max(0.0, self.cfg.loop_seconds - (self.clock() - started))):
+                return
+
+    def _wait_or_quit(self, seconds: float) -> bool:
+        """Sleep between steps; True if a QUIT file asks for a clean exit (it is removed,
+        so the next start runs normally). Checked only here, never mid-order."""
+        quit_file = Path(self.cfg.state_dir) / "QUIT"
+        deadline = time.monotonic() + seconds
+        while True:
+            if quit_file.exists():
+                quit_file.unlink(missing_ok=True)
+                log.warning("QUIT file found: exiting; open pairs stay open until restart")
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(1.0, left))
 
     def step(self) -> StepReport:
         now = int(self.clock() * 1000)
