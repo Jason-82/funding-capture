@@ -135,6 +135,28 @@ def test_discovers_perps_only_with_units(cb):
     assert v.round_qty(shib, 25_000_000) == 20_000_000  # whole contracts only
 
 
+def test_coinbase_international_perps_are_left_out():
+    api = FakeCoinbaseAPI()
+    base = {"active": True, "base": "BTC"}
+    api.load_markets = lambda: {
+        "BTC/USD": {**base, "symbol": "BTC/USD", "spot": True, "quote": "USD"},
+        "BTC/USDC:USDC": {
+            **base,
+            "symbol": "BTC/USDC:USDC",
+            "swap": True,
+            "linear": True,
+            "quote": "USDC",
+            "settle": "USDC",
+            "contractSize": 1,
+        },
+    }
+    v = CoinbaseVenue("coinbase", exchange=api, kinds=("spot", "perp"))
+    kinds = {i.symbol: i.kind for i in v.load_instruments()}
+    assert kinds["BTC/USD"] is Kind.SPOT
+    assert kinds["BIP-20DEC30-CDE"] is Kind.PERP
+    assert "BTC/USDC:USDC" not in kinds  # Coinbase International: not for US accounts
+
+
 def test_funding_is_hourly_with_next_settlement(cb):
     v, insts = cb
     s = v.fetch_funding()[insts["SHP-20DEC30-CDE"].key]

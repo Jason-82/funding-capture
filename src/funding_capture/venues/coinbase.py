@@ -135,6 +135,9 @@ class CoinbaseVenue(CcxtVenue):
             return list(self._by_symbol.values())
         if Kind.SPOT in self.kinds:
             super().load_instruments()  # spot via ccxt; ccxt's CDE markets are skipped there
+            # ccxt also lists Coinbase International's perps (BTC/USDC:USDC, AAPL/USDC:USDC)
+            # as swaps. US accounts can't trade them; US perps come from the list below.
+            self._by_symbol = {s: i for s, i in self._by_symbol.items() if not i.is_perp}
         if self._perp_kind_enabled():
             for pid, p in self._refresh_products(0).items():
                 if not self._is_perp(p):
