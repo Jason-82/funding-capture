@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -98,14 +99,28 @@ def merged_opt(exchange, key: str):
     return (getattr(exchange, "options", None) or {}).get(key)
 
 
-def _maybe_placed(exc: Exception) -> bool:
-    """After a create failed with a network error, could the order exist anyway? Not when
-    the exchange answered with an explicit refusal: rate limits and lockouts, a stale
-    nonce, a market in cancel-only/post-only mode, Kraken's EService:Unavailable/Busy.
-    Anything else may have been placed: a timeout, a dropped connection, a 5xx page, an
-    internal error (Kraken's EGeneral/EDatabase:Internal error)."""
+def _no_answer(exc: Exception) -> bool:
+    """ccxt fell back to '<id> <METHOD> <url>' with nothing from the exchange in it: the
+    reply was cut off or unreadable (a chunked reply that ended early, an HTTP status ccxt
+    doesn't map). Like a timeout, it says nothing about whether the request took effect."""
     import ccxt
 
+    return isinstance(exc, ccxt.ExchangeError) and bool(re.fullmatch(r"\S+ [A-Z]+ \S+", str(exc)))
+
+
+def _maybe_placed(exc: Exception) -> bool:
+    """After a create failed, could the order exist anyway? Not when the exchange answered
+    with a rejection or an explicit refusal: rate limits and lockouts, a stale nonce, a
+    market in cancel-only/post-only mode, Kraken's EService:Unavailable/Busy. Anything else
+    may have been placed: a timeout, a dropped or cut-off connection, a 5xx page, an
+    internal error (Kraken's EGeneral/EDatabase:Internal error), a reply ccxt couldn't
+    parse."""
+    import ccxt
+
+    if not isinstance(exc, ccxt.BaseError) or _no_answer(exc):
+        return True
+    if not isinstance(exc, ccxt.NetworkError):
+        return False  # the exchange's own answer: a rejection
     refusals = (ccxt.DDoSProtection, ccxt.RateLimitExceeded, ccxt.InvalidNonce, ccxt.OnMaintenance)
     if isinstance(exc, refusals):  # (RateLimitExceeded is not a DDoSProtection in ccxt)
         return False
@@ -487,8 +502,8 @@ class CcxtVenue(Venue):
         for i in range(tries):
             try:
                 return fn()
-            except ccxt.NetworkError as exc:
-                if i == tries - 1:
+            except ccxt.BaseError as exc:
+                if not (isinstance(exc, ccxt.NetworkError) or _no_answer(exc)) or i == tries - 1:
                     raise
                 log.warning("%s: %s failed (%s); retrying", self.name, what, exc)
                 time.sleep(0.5 * 2**i)
@@ -499,12 +514,10 @@ class CcxtVenue(Venue):
         If the exchange didn't explicitly refuse it, the order is looked up by our own id
         and carried on with; if it can't be found (or the venue gives no way to look),
         the outcome is unknown: the executor then trades nothing back against it."""
-        import ccxt
-
         cid = self._client_id(params)
         try:
             return self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params)
-        except ccxt.NetworkError as exc:
+        except Exception as exc:
             if not _maybe_placed(exc):
                 raise  # the exchange said it refused it
             order = None
@@ -539,7 +552,6 @@ class CcxtVenue(Venue):
     def _find_by_client_id(self, inst: Instrument, cid: str) -> dict | None:
         """The order we tagged with ``cid``, open or closed, or None once it is clear
         that the exchange never took it. Raises if that can't be established."""
-        import ccxt
 
         p = {"clientOrderId": cid}
         misses = 0
@@ -549,7 +561,7 @@ class CcxtVenue(Venue):
             try:
                 hits = self.ex.fetch_open_orders(inst.symbol, None, None, dict(p))
                 hits = hits or self.ex.fetch_closed_orders(inst.symbol, None, None, dict(p))
-            except ccxt.NetworkError as exc:
+            except Exception as exc:  # a failed read, not an answer: try again
                 log.warning("%s: looking up order %s failed: %s", self.name, cid, exc)
                 continue
             if hits:
@@ -577,7 +589,6 @@ class CcxtVenue(Venue):
         same order again and leave the first fill unhedged and unrecorded. Reads until the
         order is final, cancels it if it still looks open, and raises if that can't be
         confirmed (the executor then treats the trade as unsafe and halts entries)."""
-        import ccxt
 
         def read() -> dict | None:
             last = None
@@ -596,7 +607,7 @@ class CcxtVenue(Venue):
         order = read()
         if order is not None and order.get("status") not in (None, "open"):
             return order
-        with contextlib.suppress(ccxt.OrderNotFound, ccxt.BadRequest, ccxt.InvalidOrder):
+        with contextlib.suppress(Exception):  # the reads below say what happened
             self.ex.cancel_order(oid, inst.symbol)  # an IOC still "open" is pending: end it
         order = read()
         if order is None or order.get("status") in (None, "open"):

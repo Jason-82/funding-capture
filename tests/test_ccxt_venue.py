@@ -572,3 +572,97 @@ def test_lost_reply_where_the_order_cannot_be_looked_up_is_unknown(okx):
     sent["exc"] = ccxt.RateLimitExceeded("okx 429 Too Many Requests")  # refused: not placed
     with pytest.raises(ccxt.RateLimitExceeded):
         okx.place_ioc(p, "buy", 0.01, 61_000)
+
+
+def _cut_off(exchange_id="kraken"):
+    """What real ccxt raises when a chunked reply ends early: a bare
+    ExchangeError('<id> POST <url>'), not a NetworkError, with nothing from the exchange."""
+    exc = ccxt_reply_error(
+        exchange_id, 0, requests.exceptions.ChunkedEncodingError("Response ended prematurely")
+    )
+    assert type(exc) is ccxt.ExchangeError and "{" not in str(exc)
+    return exc
+
+
+def test_kraken_cut_off_reply_is_treated_like_a_lost_one(monkeypatch):
+    """A reply cut off mid-way (or one ccxt can't parse) may follow an order Kraken took:
+    it is looked up by our id like a timeout, never taken as a rejection. A real rejection
+    (Kraken's own error in the reply) is still raised at once, with no lookup."""
+    import funding_capture.venues.ccxt_venue as cv
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    sent, book, reads, cancels = {}, [], {"n": 0}, []
+
+    def create(symbol, type_, side, amount, price, params):
+        sent["cid"] = params["clientOrderId"]
+        if sent.get("took"):
+            book.append({"id": "O8", "status": "closed", "filled": amount, "average": price})
+        raise sent["exc"]
+
+    def closed(symbol, since, limit, params):
+        reads["n"] += 1
+        if sent.get("lookup_fails"):
+            raise _cut_off()
+        return [o for o in book if params.get("clientOrderId") == sent["cid"]]
+
+    v.ex.create_order, v.ex.fetch_closed_orders = create, closed
+    v.ex.fetch_open_orders = lambda *a: []
+    v.ex.fetch_order = lambda oid, symbol: book[-1]
+    v.ex.cancel_order = lambda oid, symbol, params: cancels.append(params["clientOrderId"])
+
+    for exc in (_cut_off(), KeyError("descr")):  # cut off; or ccxt choked on the reply
+        sent.update(exc=exc, took=True)
+        assert v.place_ioc(btc, "buy", 0.01, 61_000).qty == pytest.approx(0.01)
+    book.clear()
+    sent.update(exc=_cut_off(), took=False)
+    with pytest.raises(OrderOutcomeUnknown, match="Open orders"):
+        v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert cancels == [sent["cid"]]
+    # lookups cut off too: failed reads, not answers; still unknown and still cancelled
+    sent["lookup_fails"], reads["n"], cancels[:] = True, 0, []
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert reads["n"] == 6 and cancels == [sent["cid"]]
+    # Kraken's own rejection is in the reply: raised as is, nothing looked up
+    sent.update(exc=ccxt_reply_error("kraken", 200, '{"error":["EOrder:Insufficient funds"]}'))
+    sent["lookup_fails"], reads["n"] = False, 0
+    with pytest.raises(ccxt.InsufficientFunds):
+        v.place_ioc(btc, "buy", 0.01, 61_000)
+    assert reads["n"] == 0
+
+
+def test_kraken_order_reads_ride_out_a_cut_off_reply_and_a_failed_cancel(monkeypatch):
+    import funding_capture.venues.ccxt_venue as cv
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    reads = []
+
+    def flaky(oid, symbol):  # cut off once, then the real answer
+        reads.append(oid)
+        if len(reads) == 1:
+            raise _cut_off()
+        return {"id": oid, "status": "closed", "filled": 0.03, "average": 60_000}
+
+    v.ex.fetch_order = flaky
+    assert v.fetch_order_state(btc, "O2").filled == pytest.approx(0.03)
+
+    # an IOC still "open": its cancel times out, the reads after it say what filled
+    states = iter(["open"] * 6 + ["canceled"])
+    v.ex.create_order = lambda *a, **k: {"id": "O3", "status": None, "filled": None}
+    v.ex.fetch_order = lambda oid, symbol: {
+        "id": oid,
+        "status": next(states),
+        "filled": 0.04,
+        "average": 60_000,
+    }
+
+    def cancel(oid, symbol):
+        raise ccxt.RequestTimeout("kraken POST https://api.kraken.com/0/private/CancelOrder")
+
+    v.ex.cancel_order = cancel
+    assert v.place_ioc(btc, "buy", 0.1, 60_000).qty == pytest.approx(0.04)
