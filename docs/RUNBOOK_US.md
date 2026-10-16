@@ -9,8 +9,9 @@ Windows machine in Git Bash against the real Coinbase and Kraken APIs (the
 
 * Lines starting with `$` are commands. Type or paste them into Git Bash **without** the
   `$`, then press Enter.
-* **Pasting into Git Bash:** **Shift + Insert**, or right-click → **Paste**. Ctrl + V
-  usually does nothing there.
+* **Pasting into Git Bash:** **Shift + Insert**, or right-click → **Paste**. Don't press
+  Ctrl + V there: it shows nothing but garbles whatever you type or paste next. If you
+  did, press Backspace until the line is empty, then paste with Shift + Insert.
 * **Copying out of Git Bash:** select the text with the mouse. That copies it.
 * "You should see" describes the expected output. If you see something else, copy the
   whole output into the Claude chat and ask what to do.
@@ -50,10 +51,11 @@ like.
    ```
 
    Click **Yes** if Windows asks whether the installer may make changes. If you get
-   `winget: command not found`, use the website instead: on
-   <https://www.python.org/downloads/windows/> download the **Windows installer
-   (64-bit)** of the latest 3.12 release, run it, tick **Add python.exe to PATH** on the
-   first screen, then **Install Now**.
+   `winget: command not found`, download
+   <https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe> instead (3.12.10
+   is the last 3.12 release with a Windows installer; newer 3.12 entries on python.org say
+   "No files for this release", which is normal). Run it, tick **Add python.exe to PATH**
+   on the first screen, then **Install Now**.
 
 4. **Close Git Bash and open a new one** so it sees the new program. Check:
 
@@ -98,7 +100,8 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`98 passed`** (the number may be higher after updates).
+* `pytest -q` should end with **`107 passed`** (the number may be higher after updates)
+  and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate
 it. Save that as the command `bot`:
@@ -190,9 +193,9 @@ Minimise it, but don't close it: closing the window stops the program.
    $ printf '\e]0;RECORD\a'; fcap -c config.yaml --log-file logs/record.log record
    ```
 
-   The `printf …;` part names the window **RECORD** while the program runs, so you can
-   tell the windows apart in the taskbar. You should see `recorded 24 funding readings`, then another such line
-   about every 10 minutes. Minimise the window.
+   The `printf …;` part names the window **RECORD** while the program runs. Hover over
+   the Git Bash icon in the taskbar to see each window's name. You should see `recorded 24
+   funding readings`, then another such line about every 10 minutes. Minimise the window.
 
 2. **Paper trading.** Open another new Git Bash window:
 
@@ -204,22 +207,34 @@ Minimise it, but don't close it: closing the window stops the program.
    You should see `bootstrapped: … instruments, … candidates, 0 open positions`, then
    every minute a `best: spot_perp …` line and `open positions: …`. Minimise the window.
 
-3. **Keep the PC awake while these run.**
-   * **Settings → System → Power & battery** (desktops: **Power**) → **Screen and
-     sleep** → set **"When plugged in, put my device to sleep after"** to **Never**. The
-     screen may still turn off; that's fine.
-   * Laptop: keep it plugged in. If you close the lid, first set **Control Panel →
-     Power Options → Choose what closing the lid does → When plugged in: Do nothing**.
-   * Windows Update may restart the PC overnight. **Settings → Windows Update →
-     Advanced options → Active hours** sets when it won't.
+3. **Keep the PC awake while these run.** Open a third Git Bash window and run:
 
-**After a restart** (or if you closed a window by accident), repeat step 7. The bot
-picks up where it left off.
+   ```
+   $ powercfg -change -standby-timeout-ac 0
+   $ powercfg -change -hibernate-timeout-ac 0
+   ```
 
-**To stop the paper engine cleanly** (for example to change settings), in any Git Bash
-window type `bot`, then `touch state/paper/QUIT`. Within a minute the PAPER window
-prints `QUIT file found: exiting…` and returns to the `$` prompt. Avoid **Ctrl + C**:
-in Git Bash it kills the program instantly, in the middle of whatever it is doing. (The
+   That means: when plugged in, never sleep and never hibernate. The screen may still
+   turn off; that's fine. If either line prints an error, do it by hand: press the
+   Windows key, type `sleep`, open **Power, sleep and battery settings** (Windows 10:
+   **Power & sleep settings**) and set every **Plugged in** sleep and hibernate time to
+   **Never**. Depending on your Windows version the setting is called **Make my device
+   sleep after**, **When plugged in, put my device to sleep after** or **When plugged in,
+   PC goes to sleep after**.
+   * Laptop: keep it plugged in. To be able to close the lid, press the Windows key, type
+     `lid`, open **Change what closing the lid does**, set **When I close the lid →
+     Plugged in** to **Do nothing**, and click **Save changes**.
+
+**After a restart of the PC** (or if you closed a window by accident), repeat step 7. The
+bot picks up where it left off. Windows Update can restart the PC by itself at night;
+Phase 4 explains what to do about that once real money is involved.
+
+**To stop the paper engine cleanly** (for example to change settings), open a **new** Git
+Bash window. Don't type into the PAPER window: while the bot runs there it ignores what
+you type. In the new window type `bot`, then `touch state/paper/QUIT`. Usually within a
+minute (longer if it is in the middle of a trade) the PAPER window prints
+`QUIT file found: exiting…` and shows the `$` prompt again. Avoid **Ctrl + C**: in Git
+Bash it kills the program instantly, in the middle of whatever it is doing. (The
 recorder doesn't matter: close its window any time.)
 
 **Phase 1 done.**
@@ -234,20 +249,21 @@ Open Git Bash, then:
 
 ```
 $ bot
-$ tail -n 2 logs/paper.log        # time on the last line: within the last 2 minutes
-$ tail -n 1 logs/record.log       # within the last 10 minutes
-$ fcap -c config.yaml status      # paper positions and results
+$ fcap -c config.yaml status                      # paper positions and results
+$ grep "^20" logs/record.log | tail -n 1          # time at the start: within 10 minutes
 $ grep -ciE "critical|error|halted" logs/paper.log    # ideally 0
 ```
 
-The log lines start with the date and time as your PC shows it. If a log has stopped
-moving, that program isn't running: check its window, then restart it as in step 7.
+`status` starts with `last update: 0 min ago` (or 1, 2). If it prints `WARNING: no
+update for … min`, the paper engine has stopped: start it again as in step 7. The
+recorder line starts with the date and time; if that is more than 10 minutes old,
+restart the recorder as in step 7.
 
-`status` shows open pairs (coin, venues, size, funding earned, fees), closed pairs with
-their net result, and once a day has passed:
+`status` then shows open pairs (coin, venues, size, funding earned, fees), closed pairs
+with their net result, and once a day has passed:
 
 ```
-running for 9.2 days on $5,000 of capital
+first started 9.2 days ago, on $5,000 of capital
 annualised return on capital so far: +12.4%  (noisy until a few weeks have passed)
 ```
 
@@ -263,7 +279,13 @@ $ start trades.csv
 
 This replays the recorded funding with your settings. Read: `net pnl`, **`APR on
 capital`**, `funding / costs`, number of trades. `start trades.csv` opens the trade
-list in Excel. Two weeks is short, so treat it as a sanity check, not a verdict.
+list in Excel (close it there before running the backtest again). Two weeks is short, so
+treat it as a sanity check, not a verdict.
+
+The backtest leaves out Coinbase's $0.20-per-contract minimum fee and the fact that
+futures trade in whole contracts. It therefore looks better than reality on small
+contracts (1000SHIB, 1000PEPE) and can show BTC trades the bot can't size at your
+settings. When it and paper disagree, trust the paper numbers from `status`.
 
 ### After 4 weeks: tune and decide
 
@@ -271,13 +293,17 @@ list in Excel. Two weeks is short, so treat it as a sanity check, not a verdict.
 $ fcap -c config.yaml sweep
 ```
 
-This tries many settings: it picks on the first half of the data and scores on the
-second half (`test_apr_pct`). Paste the output to Claude if you want help choosing.
+This tries combinations of settings around yours. Each row is one combination:
+`train_apr_pct` is its result on the first half of the data, `test_apr_pct` on the
+second half, and `*` in the `yours` column marks your current settings. Good settings
+have a good `test_apr_pct` close to `train_apr_pct`; don't just take the top row. Paste
+the output to Claude if you want help choosing.
 
-To change a setting: `notepad config.yaml`, edit, Ctrl + S, close Notepad. The paper
-engine reads settings when it starts, so restart it: `touch state/paper/QUIT`, wait until
-the PAPER window shows the `$` prompt again, then in that window press **↑** (brings back
-the last command) and Enter.
+To change a setting: `notepad config.yaml`, edit, Ctrl + S, close Notepad. Keep the
+indentation exactly as it was (spaces, never Tab). The paper engine reads settings when
+it starts, so restart it: in a **new** Git Bash window type `bot` and
+`touch state/paper/QUIT`, wait until the PAPER window shows the `$` prompt again, then
+click the PAPER window, press **↑** (brings back the last command) and Enter.
 
 **Decision rule** (from `status` and the backtest):
 
@@ -308,8 +334,12 @@ Only after a "go". Still no money moves in this phase.
 1. Find your public IP address (used to lock the key to your connection):
 
    ```
-   $ curl -s https://api.ipify.org; echo
+   $ curl -s https://api64.ipify.org; echo
    ```
+
+   If it prints four numbers with dots (like `203.0.113.7`), you can use it as the IP
+   allowlist below. If it prints an address with colons, your connection uses IPv6,
+   which Windows changes every day: leave the allowlist empty.
 
 2. Go to **portal.cdp.coinbase.com** and sign in with your Coinbase account. Open
    **API keys** → **Secret API keys** → **Create API key**.
@@ -317,25 +347,31 @@ Only after a "go". Still no money moves in this phase.
    * Nickname: `funding-bot`
    * Portfolio: **Default**
    * Permissions: **View** ✅ **Trade** ✅ **Transfer** ❌ (leave off)
-   * IP allowlist: the address from step 1. If your home IP changes often, you can leave
-     this empty; the key still can't move money.
+   * IP allowlist: the address from step 1. Leave it empty if step 1 printed colons or
+     if your home IP changes from time to time: if it changes while a pair is open, the
+     bot can't trade until you update the allowlist. The key can't move money either
+     way.
    * Advanced settings → signature algorithm: **ECDSA**
 4. Create. A file named like `cdp_api_key.json` downloads to your **Downloads**
-   folder. Store it in the bot, then delete the download:
+   folder. Store it in the bot:
 
    ```
    $ bot
    $ ls ~/Downloads/*.json
    $ fcap keys coinbase --json ~/Downloads/cdp_api_key.json
-   $ rm ~/Downloads/cdp_api_key.json
    ```
 
    `ls` shows the exact file name. If your browser named it differently (for example
-   `cdp_api_key (1).json`), use that name in quotes in the next two lines:
+   `cdp_api_key (1).json`), put that name in quotes:
    `--json "$HOME/Downloads/cdp_api_key (1).json"`.
 
    You should see `saved COINBASE_API_KEY, COINBASE_SECRET_FILE to .env`. The private
-   key itself goes to `C:\Users\<you>\.fcap\coinbase.pem`.
+   key itself goes to `C:\Users\<you>\.fcap\coinbase.pem`. **Only after you see that
+   `saved …` line**, delete the download (Coinbase shows the key only once):
+
+   ```
+   $ rm ~/Downloads/cdp_api_key.json
+   ```
 
 ### 3c. Kraken: create the API key
 
@@ -410,15 +446,19 @@ them too.
 
 ### 4a. Fund the accounts
 
-For the first trial the bot opens **one** pair of at most $600:
+For the first trial the bot opens **one** pair of at most $600. It buys the coin on
+Kraken and holds the short on Coinbase (4b sets this up):
 
 * **Kraken:** deposit about **$800 USD** (Funding → Deposit → USD → bank/ACH). It buys
   the spot coin with this.
 * **Coinbase:** keep about **$800 USD** in the **Default** portfolio. Futures margin is
   drawn from that USD balance (Coinbase transfers it to the futures account itself; its
   futures help pages describe the timing). Overnight margin on alt-coin shorts can reach
-  30–95% of their value, so keep the full amount there. Some pairs use Coinbase spot
-  instead of Kraken; this covers those too.
+  30–95% of their value, so keep the full amount there.
+
+The bot doesn't check each exchange's cash separately, only `capital_usd`. A pair that
+bought its coin on Coinbase would need about $1,200 there (the coin plus the margin),
+which is why 4b keeps Coinbase to the short.
 
 ### 4b. Switch the config to live, sized to one contract
 
@@ -426,8 +466,8 @@ For the first trial the bot opens **one** pair of at most $600:
 $ notepad config.yaml
 ```
 
-**Change these existing lines** (don't add a second `portfolio:` section; the bot
-refuses duplicate sections):
+**Change these existing lines** (don't add a second `portfolio:` or `venues:` section;
+the bot refuses duplicate sections):
 
 ```yaml
 mode: live                      # was: paper
@@ -437,9 +477,35 @@ portfolio:
   max_position_usd: 600         # was: 1000
 ```
 
-Save and close Notepad.
+and **add one line** under `coinbase:` in the `venues:` section, with the same four
+spaces in front as the lines around it:
+
+```yaml
+venues:
+  coinbase:
+    quotes: [USD, USDC]
+    paper_leverage: 1.0
+    kinds: [perp]               # add: Coinbase only for the short; coins come from Kraken
+```
+
+If this Kraken account is used only by the bot, also delete the `# ` (hash and space)
+in front of `dead_man_seconds: 120` under `kraken:`. Kraken then cancels any order the
+bot left open 2 minutes after the bot stops for any reason. Don't do it if you place
+your own orders on that account: it would cancel those too.
+
+Save and close Notepad, then check the file still loads:
+
+```
+$ fcap -c config.yaml check
+```
+
+(If it prints a long error mentioning `yaml`, see Troubleshooting.)
 
 ### 4c. Start it
+
+First, stop Windows from restarting the PC by itself while real money is in play:
+**Settings → Windows Update → Pause updates** (pick the longest period). Install updates
+yourself after stopping the bot with QUIT (see "Stopping" below), then start it again.
 
 Open a new Git Bash window:
 
@@ -448,9 +514,11 @@ $ bot
 $ printf '\e]0;LIVE\a'; fcap -c config.yaml --log-file logs/live.log live --i-understand-this-trades-real-money
 ```
 
-Minimise the window; never close it while the bot runs (see "Stopping" below). It opens
-a pair only when one passes your rules. That may take hours or days. The paper engine
-can keep running alongside for comparison; it keeps separate records.
+Wait until you see `bootstrapped: …` and one `open positions: …` line, then minimise
+the window; never close it while the bot runs (see "Stopping" below). It opens a pair
+only when one passes your rules. That may take hours or days. The paper engine can keep
+running alongside for comparison; it keeps separate records. If it says `another engine
+is already running`, a LIVE window is already open: use that one.
 
 ### 4d. Watch the first trade closely
 
@@ -475,27 +543,46 @@ If anything doesn't match, stop the bot (see below) and paste
 ### 4e. Scale up slowly
 
 After a couple of clean round trips, raise `max_positions` (2, then 4) and
-`max_position_usd`, and keep `capital_usd` equal to what you actually deposited. Restart
-the live engine after each change (`touch state/live/QUIT`, wait for the `$` prompt in
-the LIVE window, ↑, Enter).
+`max_position_usd`, and keep `capital_usd` equal to what you actually deposited. Kraken
+pays for all the coins and Coinbase holds the margin for all the shorts, so keep each
+exchange at about half of `capital_usd` and add money to both when you raise it.
+Restart the live engine after each change: in a **new** Git Bash window `bot` and
+`touch state/live/QUIT`, wait for the `$` prompt in the LIVE window, then click the LIVE
+window, ↑, Enter.
 
 ### Stopping, pausing, emergencies
 
-Run these from any Git Bash window after `bot`.
+Run these in a **separate** Git Bash window after `bot`, **never in the LIVE window**:
+while the bot runs there, that window ignores what you type (and may run it later, after
+the bot has stopped).
 
 | You want to | Do this |
 |---|---|
 | pause new trades (keep managing open ones) | `touch state/live/STOP` (resume: `rm state/live/STOP`) |
-| close everything now | `touch state/live/FLATTEN` |
-| stop the program | `touch state/live/QUIT`. It exits within a minute, between steps, never halfway through an order; then close the window. Open pairs stay open and are managed again when you restart |
-| restart the PC (e.g. Windows Update) | `touch state/live/QUIT` first, then restart, then start it again (4c) |
-| `status` says `ENTRIES HALTED` | the bot hit something it won't guess about (e.g. an order it couldn't confirm). Stop it, check open orders and positions on both exchanges, fix by hand, restart |
+| close everything now | `touch state/live/FLATTEN` (trade again later: `rm state/live/FLATTEN`) |
+| stop the program | `touch state/live/QUIT`, then wait until the LIVE window shows the `$` prompt. That is usually within a minute, but can take several minutes while it is opening or closing a pair, because it never stops halfway through an order. Only then close the window. Open pairs stay open and are managed again when you restart |
+| restart the PC (e.g. to install updates) | `touch state/live/QUIT`, wait for the `$` prompt in the LIVE window, restart, then start LIVE again (4c), then RECORD and PAPER (step 7) |
+| the PC restarted by itself (power cut, crash, update), or the LIVE window is gone | this is an unclean stop: do the checks below, then start LIVE again (4c), then RECORD and PAPER (step 7) |
+| `status --live`, the LIVE window or `logs/live.log` shows `ENTRIES HALTED:` with any reason other than `STOP file present`, `FLATTEN file present` or `stale market data` | the bot hit something it won't guess about (e.g. an order it couldn't confirm). Stop it with QUIT, do the checks below, fix by hand, restart |
+| `fcap … live` says `another engine is already running` | a LIVE window is still open (hover over the Git Bash icon in the taskbar). Use that one; never run two |
 
 **Don't stop the live bot with Ctrl + C or the window's ✕.** In Git Bash both kill it
-instantly. If that happens while it is opening a pair, one leg can be left on an
-exchange without the bot knowing about it. If it ever happens, compare both exchanges'
-positions and open orders with `fcap -c config.yaml status --live` and close anything
-the bot doesn't list, by hand, before restarting.
+instantly, possibly in the middle of a trade. A power cut, a crash or Windows restarting
+by itself does the same. **After any stop that didn't go through QUIT**, check before
+starting it again:
+
+1. On Kraken and on Coinbase, open the **Open orders** list and **Cancel** every order
+   there. The bot never leaves an order open when it stops normally, so any open order
+   is a leftover, and it could still fill.
+2. **Coinbase → Futures → Positions:** each short must match a pair that
+   `fcap -c config.yaml status --live` lists for that coin, with the same qty. Close any
+   other short by hand.
+3. **Kraken (and Coinbase spot):** a coin the bot doesn't list, and that you didn't own
+   before, is a leftover: sell it.
+4. If `status --live` lists a pair whose coins or short are partly or fully gone, leave
+   it: on restart the bot sees the mismatch and closes what is left (log line
+   `FLATTENED`). If you also hold that coin yourself on that exchange, paste the details
+   to Claude first.
 
 ### Daily routine once live
 
@@ -506,6 +593,10 @@ $ fcap -c config.yaml check                        # Coinbase "margin buffer" li
 $ grep -iE "critical|error|halted|still open" logs/live.log | tail
 ```
 
+* `status --live` must say `last update: 0 min ago` (or a few minutes). If it prints
+  `WARNING: no update for … min`, the live bot is **not running** and nothing is
+  watching your open pairs: do the checks under "Stopping" and start it again (4c).
+* If it shows `ENTRIES HALTED:`, see the table under "Stopping".
 * Margin buffer: the bot warns at 35% and closes pairs at 20%. Add USD to Coinbase well
   before that.
 * Weekly: compare the bot's positions and funding with both exchanges' statements.
@@ -545,24 +636,29 @@ scaling up.
 | Symptom | Fix |
 |---|---|
 | `bash: fcap: command not found` | new window: type `bot` (or `cd ~/funding-capture && source .venv/Scripts/activate`) |
-| `bash: bot: command not found` | run the `echo "alias bot=…"` line from step 3 once more, then close and reopen Git Bash |
-| `bash: py: command not found` | Python isn't installed, or Git Bash was opened before installing it: close and reopen Git Bash; if it persists, reinstall from python.org with **Add python.exe to PATH** ticked |
+| `bash: bot: command not found` | run these two lines, then close and reopen Git Bash:<br>`[ -e ~/.bash_profile ] \|\| echo 'test -f ~/.profile && . ~/.profile' >> ~/.bash_profile`<br>`grep -qs bashrc ~/.bash_profile \|\| echo 'test -f ~/.bashrc && . ~/.bashrc' >> ~/.bash_profile`<br>If it still fails, run `grep "alias bot" ~/.bashrc`; only if that prints nothing, run the `echo "alias bot=…"` line from step 3 again |
+| `bash: py: command not found` | Python isn't installed, or Git Bash was opened before installing it: close and reopen Git Bash; if it persists, install from the 3.12.10 link in step 1 with **Add python.exe to PATH** ticked |
 | `python` opens the Microsoft Store | use `py -3.12` (needed only before step 3); or turn off **Settings → Apps → Advanced app settings → App execution aliases → python.exe / python3.exe** |
 | `.venv/bin/activate: No such file or directory` | on Windows it's `.venv/Scripts/activate` |
-| pasting does nothing | **Shift + Insert**, or right-click → Paste |
+| pasting does nothing, or the line starts with `^[[200~` | press Backspace until the line is empty, then **Shift + Insert** or right-click → Paste (not Ctrl + V) |
+| a Git Bash window stopped showing anything after you pressed Ctrl + S in it | click in it and press **Ctrl + Q** |
 | `git clone` asks for a username/password in the window | the sign-in window didn't appear: reinstall Git for Windows with the default options (they include Git Credential Manager) and clone again |
 | `FAIL markets: NetworkError` | internet, VPN or firewall, or the exchange is down: retry |
 | `FAIL credentials: COINBASE_SECRET_FILE: cannot read …` | re-run `fcap keys coinbase --json <file>` with a freshly created key |
-| `FAIL balance: AuthenticationError` | wrong key, missing permission, or your IP changed (update the allowlist) |
+| `FAIL balance: AuthenticationError` | wrong key or missing permission. If you set an IP allowlist, empty it on the exchange and run `check` again (your IP changed, or your connection uses IPv6) |
 | Kraken `EAPI:Invalid nonce`, or Coinbase `401` | clock: **Settings → Time & language → Date & time → Sync now**. If it persists, the key was used by another program: make a new key just for the bot |
 | Coinbase order `403` / "onboarded users" | finish futures onboarding (3a) |
-| `PermissionError` naming `engine.json` | another program (Excel, an editor, a sync or backup tool) has the bot's state file open: close it. The bot retries for 2 seconds before giving up |
+| `cannot write …engine.json` (CRITICAL) | another program (Excel, an editor, a sync or backup tool) has the bot's state file open: close it. Until the file can be written the bot opens no new pairs and QUIT waits; it carries on normally once the file is free |
+| `PermissionError … trades.csv` | the file is still open in Excel: close it there, then run the backtest again |
+| a long error mentioning `yaml` (`ScannerError`, `found character '\t'`, `mapping values are not allowed here`, `could not find expected ':'`) right after editing config.yaml | `notepad config.yaml` and look at the lines you changed: they must start with exactly as many spaces as the lines around them (never Tab), and have a space after each colon (`capital_usd: 1600`). Save, close, try again |
+| `another engine is already running on state/…` | that engine's window is still open (hover over the Git Bash icon in the taskbar): use it. Never run two |
+| `status` prints `WARNING: no update for … min` | that engine isn't running: start it again (paper: step 7; live: the checks under "Stopping", then 4c) |
 | `duplicate key 'portfolio'` | you pasted a second section into config.yaml: merge them into one |
 | `fees.kraken.spot_maker … fractions` | write `0.004`, not `0.4` or `0.4%` |
 | `found state/engine.json from an older version` | move it to `state/paper/` or `state/live/` as the message says |
 | `scan` never shows `*` | normal in quiet markets; check your `fees:` are right |
 | many `maker order … timed out` in the log | spot orders aren't filling: raise `execution.maker_timeout_s` a little, or that coin is too thin |
-| a window shows nothing new for a long time | check the log (`tail -n 2 logs/paper.log`): if its last line is old too, the program died; start it again |
+| a window shows nothing new for a long time | run `fcap -c config.yaml status` (add `--live` for the live bot): if it prints `WARNING: no update…`, the program has stopped; start it again. If it refuses with `another engine is already running`, it is still alive: find its window |
 
 ## Command reference
 
@@ -578,18 +674,24 @@ fcap -c config.yaml sweep
 fcap -c config.yaml paper
 fcap -c config.yaml live --i-understand-this-trades-real-money
 fcap -c config.yaml status [--live]
-global options: -v (debug)  --log-file FILE  --env-file FILE (default .env)
+global options go right after `fcap`, before the command name:
+  -c FILE   -v (debug)   --log-file FILE   --env-file FILE (default .env)
+  right: fcap -c config.yaml --log-file logs/paper.log paper
+  wrong: fcap -c config.yaml paper --log-file logs/paper.log   (unrecognized arguments)
 
 kill switches (paper engine: state/paper/, live engine: state/live/)
 touch state/live/STOP       no new pairs            rm state/live/STOP to resume
 touch state/live/FLATTEN    close all pairs         rm state/live/FLATTEN to trade again
-touch state/live/QUIT       exit the program cleanly (the file removes itself)
+touch state/live/QUIT       exit cleanly between steps (the file removes itself)
+run them in a separate Git Bash window, never in the window the bot runs in
 ```
 
 ## On a Mac or Linux instead
 
 The same steps work in Terminal with these changes: install Python 3.12 with your
 package manager and type `python3.12` where this says `py -3.12`; activate with
-`source .venv/bin/activate`; run the long-lived programs under `tmux` (or
-`nohup … &`) instead of in separate windows; keep a Mac awake with `caffeinate -dims`.
-There, `fcap keys` hides the private key while you paste it.
+`source .venv/bin/activate` (also in the `bot` line, which goes into `~/.zshrc` on a
+Mac); run the long-lived programs under `tmux` (or `nohup … &`) instead of in separate
+windows; keep a Mac awake with `caffeinate -dims`. Stop the bot with QUIT there too
+(Ctrl + C can also interrupt it mid-trade). `fcap keys` hides the private key while you
+paste it.

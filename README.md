@@ -65,7 +65,8 @@ used `state/engine.json`; the engine refuses to start until you move that file).
 while the engine runs: `touch state/<mode>/STOP` blocks new entries;
 `touch state/<mode>/FLATTEN` closes every pair and stops opening new ones;
 `touch state/<mode>/QUIT` ends the program between steps (open pairs stay open and are
-picked up on restart). Use QUIT rather than Ctrl+C in Git Bash on Windows.
+picked up on restart). Use QUIT rather than Ctrl+C in Git Bash on Windows. Only one
+engine runs per state folder: a second `paper` or `live` exits with a message.
 
 Legs on venues listed in `costs.maker_venues` are worked with post-only orders (rest at
 the touch, hedge each fill immediately on the other leg). That matters on venues where
