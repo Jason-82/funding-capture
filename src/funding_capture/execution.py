@@ -288,6 +288,10 @@ class PairExecutor:
                 if self._sendable(b, left, qa.mid) > 0:
                     reason = "hedge failed"  # the hedge venue refused a sendable amount
                     break
+            if reason == "sub-lot remainder" and carry > 1e-12:  # fills below one hedge lot
+                c = _Carry(carry)
+                remaining -= self._top_up(a, b, c, rep, remaining)
+                carry = c.qty
         except Exception as exc:
             rep.unsafe = True
             reason = "execution error"
@@ -300,8 +304,8 @@ class PairExecutor:
     ) -> ExecutionReport:
         rep = ExecutionReport()
         vm = self.venues[m.inst.venue]
-        try:
-            ref_mid = self._quotes([m])[0].mid
+        try:  # both legs: a hedge leg with no book (halted) must stop us before any order
+            ref_mid = self._quotes([m, h])[0].mid
         except Exception as exc:
             raise PreTradeError(f"no quotes: {exc}") from exc
         min_qty = self._min_qty(m, h, ref_mid)
@@ -353,7 +357,8 @@ class PairExecutor:
                 finally:
                     if resting:  # never leave our order on the book when we stop looking
                         final = vm.cancel_order(m.inst, oid)
-                        self._absorb(m, h, final, seen, carry, rep, hedge=not failed)
+                        if not self._absorb(m, h, final, seen, carry, rep, hedge=not failed):
+                            failed, reason = True, "hedge failed"
                         if final.is_open:
                             rep.unsafe = True
                             rep.messages.append(f"order {oid} on {m.inst.key} may still be open")
@@ -420,18 +425,16 @@ class PairExecutor:
         q = vm.round_qty(m.inst, need + 1e-9 * max(1.0, need))  # onto the grid, not under
         if need <= 1e-12 or q < need * (1 - 1e-9) or q > room * (1 + 1e-9):
             return 0.0
-        touch, _ = self._quotes([m])[0].touch(m.order_side)
-        f = self._ioc(m, q, touch, self.p.entry_slippage_bps)
-        if f.qty <= 0:
+        got = q - self._hedge(m, q, rep)  # IOCs with widening limits; skips sub-minimum sizes
+        if got <= 1e-12:
             return 0.0
-        rep.fills.append(f)
-        carry.qty += f.qty
+        carry.qty += got
         want = carry.qty
         left = self._hedge(h, want, rep)
         rep.hedged_qty += want - left
         carry.qty = left
-        rep.messages.append(f"topped up {f.qty:.6g} on {m.inst.key} to a whole hedge lot")
-        return f.qty
+        rep.messages.append(f"topped up {got:.6g} on {m.inst.key} to a whole hedge lot")
+        return got
 
     def _moved_away(self, m: _LegPlan, our_price: float) -> bool:
         q = self._quotes([m])[0]

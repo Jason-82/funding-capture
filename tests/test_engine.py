@@ -720,3 +720,40 @@ def test_held_spot_not_in_whole_contracts_is_closed_leg_by_leg(tmp_path, clock, 
     assert w.engine.step().closed == [pos.id]
     assert spot_venue.fetch_spot_balance(c.long) == pytest.approx(0, abs=1e-9)
     assert perp_venue.fetch_perp_positions() == {}
+
+
+def test_held_leg_missing_from_candidates_still_gets_data(tmp_path, clock):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    gone = pos.candidate.short  # e.g. a product halted when the bot started
+    w.engine.instruments.pop(gone.key)
+    w.engine.snaps.pop(gone.key, None)
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    rep = w.engine.step()
+    assert gone.key in w.engine.snaps and rep.closed == []
+
+
+def test_quote_a_venue_stops_giving_is_dropped(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    w.engine.step()
+    assert w.p_b.key in w.engine.quotes
+    real = w.db.fetch_quotes
+    monkeypatch.setattr(
+        w.db, "fetch_quotes", lambda insts: {k: q for k, q in real(insts).items() if False}
+    )
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert w.p_b.key not in w.engine.quotes
+
+
+def test_close_failure_count_resets_once_no_close_is_wanted(tmp_path, clock):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    w.engine._close_fails[pos.id] = 1
+    w.engine._close_idle[pos.id] = 4
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()  # healthy pair, no exit wanted
+    assert pos.id not in w.engine._close_fails and pos.id not in w.engine._close_idle

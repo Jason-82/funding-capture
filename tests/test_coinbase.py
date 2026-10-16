@@ -330,6 +330,8 @@ def test_halted_perp_is_not_traded_but_its_position_is_still_read():
     ]
     (pos,) = v.fetch_perp_positions().values()
     assert pos.instrument.symbol == "BIP-20DEC30-CDE" and pos.qty == pytest.approx(-0.02)
+    with pytest.raises(RuntimeError, match="halted"):  # so nothing trades against it
+        v.fetch_touch(pos.instrument)
     api.positions[0]["side"] = "SOMETHING_NEW"
     with pytest.raises(ValueError, match="unexpected side"):
         v.fetch_perp_positions()  # unknown, never guessed as long

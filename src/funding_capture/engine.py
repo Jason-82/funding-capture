@@ -133,6 +133,7 @@ class Engine:
         self._close_blocked_until: dict[str, int] = {}  # pair id -> ms, after a failed close
         self._close_fails: dict[str, int] = {}  # pair id -> failed closes in a row
         self._close_idle: dict[str, int] = {}  # pair id -> tries in a row that traded nothing
+        self._close_wanted: set[str] = set()  # pairs some path tried to close this step
         self._untracked_seen: set[str] = set()
         self.state_path = Path(config.state_dir) / "engine.json"
 
@@ -265,6 +266,7 @@ class Engine:
             self._started_ms = now
         rep = StepReport()
         self._touched = set()
+        self._close_wanted = set()
         for v in self.venues.values():
             v.tick(now)
             v.heartbeat()
@@ -286,7 +288,14 @@ class Engine:
 
     # ------------------------------------------------------------------ data
     def _instruments_on(self, venue: str) -> list[Instrument]:
-        return [i for i in self.instruments.values() if i.venue == venue]
+        """What to fetch data for: candidates, plus the legs of held pairs (a leg can drop
+        out of the candidates, e.g. a product halted at startup, and still need data)."""
+        out = {i.key: i for i in self.instruments.values() if i.venue == venue}
+        for p in self.positions.values():
+            for i in (p.candidate.long, p.candidate.short):
+                if i.venue == venue:
+                    out.setdefault(i.key, i)
+        return list(out.values())
 
     def refresh(self, now: int, with_positions: bool = True) -> None:
         # every venue we trade perps on, so a position no pair accounts for is noticed
@@ -312,6 +321,8 @@ class Engine:
                     log.warning("%s: market data refresh failed: %s", venue_name, exc)
                     continue
                 self.snaps.update(snaps)
+                for k in [k for k in self.quotes if k.startswith(name + ":")]:
+                    del self.quotes[k]  # a quote the venue no longer gives (halted) must go
                 self.quotes.update(quotes)
                 if perp_pos is not None:
                     for k in [k for k in self._perp_positions if k.startswith(name + ":")]:
@@ -553,6 +564,9 @@ class Engine:
             s = scored.get(pos.candidate.key) or self._score(pos.candidate)
             reason = should_exit(s, self.strategy, (now - pos.opened_ms) / MS_PER_HOUR)
             if reason is None:
+                if pos.id not in self._close_wanted:  # no close wanted now: start afresh
+                    self._close_fails.pop(pos.id, None)
+                    self._close_idle.pop(pos.id, None)
                 continue
             if self._imminent_funding(pos.candidate, now) > 0:
                 continue  # collect the settlement that is about to pay us, then leave
@@ -563,6 +577,7 @@ class Engine:
         self, pos: PairPosition, reason: str, rep: StepReport, now: int, urgent: bool = False
     ) -> None:
         c = pos.candidate
+        self._close_wanted.add(pos.id)
         if self._close_blocked_until.get(pos.id, 0) > now:
             return
         down = [v for v in c.venues if self._stale(v, now)]
@@ -702,6 +717,8 @@ class Engine:
         self._touched.add(pos.id)
         legs = ((c.long, 1), (c.short, -1))
         try:  # read both legs before trading either, and now, not at the start of the step
+            for inst, _ in legs:  # both books must answer (a halted leg raises here)
+                self.venues[inst.venue].fetch_touch(inst)
             helds = []
             for inst, sign in legs:
                 if inst.is_perp:

@@ -178,3 +178,50 @@ def test_maker_fill_below_one_contract_is_topped_up_not_sold_back():
     assert vb.fetch_perp_positions()[cand.short.key].qty == pytest.approx(-10)
     assert not [f for f in rep.fills if f.instrument == cand.long and f.order_side == "sell"]
     assert any("topped up" in m for m in rep.messages)
+
+
+def test_ioc_close_with_a_thin_spot_touch_tops_up_instead_of_selling_back():
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    ex = PairExecutor({"a": va, "b": vb}, ExecutionParams(max_slice_usd=1_000))
+    assert ex.open(cand, 1_010).hedged_qty == pytest.approx(10)
+    da.set_quote(cand.long, 99.9, 100.1, size=3)  # less than one contract on the bid
+    db.set_quote(cand.short, 100.0, 100.2, size=12)
+    rep = ex.close(cand, 10, urgent=True)
+    assert rep.complete and vb.fetch_perp_positions() == {}
+    assert va.fetch_spot_balance(cand.long) == pytest.approx(0, abs=1e-9)
+    assert not [f for f in rep.fills if f.instrument == cand.long and f.order_side == "buy"]
+
+
+def test_top_up_below_the_maker_venue_minimum_is_not_an_error():
+    from funding_capture.models import OrderState
+
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    va.min_qty = lambda inst: 0.5  # Kraken-style minimum order on the spot leg
+    real_ioc = va.place_ioc
+
+    def kraken_ioc(inst, side, qty, limit, reduce_only=False):
+        if qty < 0.5:
+            raise RuntimeError('kraken {"error":["EOrder:Order minimum not met"]}')
+        return real_ioc(inst, side, qty, limit, reduce_only)
+
+    va.place_ioc = kraken_ioc
+    t = [0.0]
+    ex = PairExecutor(
+        {"a": va, "b": vb},
+        ExecutionParams(max_slice_usd=5_000, maker_timeout_s=60, maker_poll_s=10),
+        maker_venues=("a",),
+        sleep=lambda sec: t.__setitem__(0, t[0] + sec),
+        clock=lambda: t[0],
+    )
+    done = {}
+
+    def part_filled(inst, oid):  # 9.8 of 10 fill: the 0.2 left is below the minimum
+        if oid not in done:
+            done[oid] = True
+            va._apply(va._book(inst), 9.8, 99.9)
+        return OrderState(oid, 9.8, 99.9, 1.0, True)
+
+    va.fetch_order_state = part_filled
+    va.cancel_order = lambda inst, oid: OrderState(oid, 9.8, 99.9, 1.0, False)
+    rep = ex.open(cand, 1_010)
+    assert not rep.unsafe and not rep.has_residual  # unwound, but no "execution error"

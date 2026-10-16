@@ -234,6 +234,9 @@ class CoinbaseVenue(CcxtVenue):
     def fetch_touch(self, inst: Instrument) -> Quote:
         if not inst.is_perp:
             return super().fetch_touch(inst)
+        if not self._tradeable(self._refresh_products().get(inst.symbol) or {}):
+            # halted / cancel-only: no quote, so nothing is traded against this leg
+            raise RuntimeError(f"coinbase {inst.symbol} is halted or cancel-only")
         book = (
             self.ex.v3PublicGetBrokerageMarketProductBook(
                 {"product_id": inst.symbol, "limit": 1}
