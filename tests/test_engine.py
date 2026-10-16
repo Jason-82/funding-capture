@@ -812,3 +812,23 @@ def test_dust_below_one_order_counts_as_flat(tmp_path, clock, monkeypatch, caplo
     w.touch_quotes()
     w.engine.step()
     assert pos.id not in w.engine.positions and "could not flatten" not in caplog.text
+
+
+def test_open_that_was_unwound_records_its_cost(tmp_path, clock, monkeypatch):
+    from funding_capture.models import Fill
+
+    w = _spot_perp_world(tmp_path, clock)
+
+    def unwound(cand, notional):
+        rep = _report(w.engine.executor)
+        rep.fills += [
+            Fill(cand.long, "buy", 2.0, 100.2, 0.4),
+            Fill(cand.long, "sell", 2.0, 99.8, 0.8),  # the hedge failed: sold back
+        ]
+        return rep
+
+    monkeypatch.setattr(w.engine.executor, "open", unwound)
+    w.engine.step()
+    (lost,) = w.engine.closed
+    assert lost.qty == 0 and lost.entry_fees_usd == pytest.approx(1.2)
+    assert lost.net_pnl_usd == pytest.approx(-1.2 - 0.8)  # fees plus 2 x $0.40 spread

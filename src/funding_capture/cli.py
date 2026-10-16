@@ -230,7 +230,16 @@ def cmd_status(args, settings: Settings) -> None:
     capital = data.get("capital_usd") or settings.portfolio.capital_usd
     if started:
         days = (datetime.now(UTC).timestamp() * 1000 - started) / 86_400_000
-        total = realised + running
+        # open pairs are counted as if closed now: minus what closing them will cost
+        exit_est = sum(
+            settings.costs.round_trip_cost(p.candidate, p.long_entry, p.short_entry)
+            / 2
+            * p.entry_notional
+            for p in open_
+        )
+        if open_:
+            print(f"estimated cost to close the open pairs: ${exit_est:,.2f} (counted below)")
+        total = realised + running - exit_est
         print(f"first started {days:.1f} days ago, on ${capital:,.0f} of capital")
         if days >= 1:
             print(
@@ -488,6 +497,7 @@ def _backtester(args, settings: Settings):
         max_positions=settings.portfolio.max_positions,
         max_positions_per_asset=settings.portfolio.max_positions_per_asset,
         min_position_usd=settings.portfolio.min_position_usd,
+        max_position_usd=settings.portfolio.max_position_usd,
     )
     return Backtester(instruments, series, settings.strategy, settings.costs, cfg)
 

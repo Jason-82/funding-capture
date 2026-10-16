@@ -100,7 +100,7 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`145 passed`** (the number may be higher after updates)
+* `pytest -q` should end with **`151 passed`** (the number may be higher after updates)
   and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate
@@ -274,9 +274,13 @@ the RECORD window (✕ is fine for the recorder) and start it again as in step 7
 with their net result, and once a day has passed:
 
 ```
+estimated cost to close the open pairs: $4.10 (counted below)
 first started 9.2 days ago, on $5,000 of capital
 annualised return on capital so far: +12.4%  (noisy until a few weeks have passed)
 ```
+
+The return already subtracts what closing the open pairs would cost, so it is the number
+to judge by.
 
 If the error count grows, run `grep -iE "critical|error|halted" logs/paper.log | tail -20`
 and paste the output to Claude.

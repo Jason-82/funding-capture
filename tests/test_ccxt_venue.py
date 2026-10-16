@@ -397,3 +397,55 @@ def test_kraken_ioc_fill_is_confirmed_never_assumed_zero(monkeypatch):
     v.ex.fetch_order = down
     with pytest.raises(RuntimeError, match="could not be confirmed"):
         v.place_ioc(btc, "buy", 0.1, 60_000)
+
+
+def test_kraken_reads_and_cancels_ride_out_short_outages(monkeypatch):
+    import funding_capture.venues.ccxt_venue as cv
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    blips = {"read": 1, "cancel": 1}
+    cancels = []
+
+    def read(oid, symbol):
+        if blips["read"]:
+            blips["read"] -= 1
+            raise ccxt.RequestTimeout("timed out")
+        return {"id": oid, "status": "canceled", "filled": 0.02, "average": 60_000}
+
+    def cancel(oid, symbol):
+        cancels.append(oid)
+        if blips["cancel"]:
+            blips["cancel"] -= 1
+            raise ccxt.ExchangeNotAvailable("EService:Unavailable")
+
+    v.ex.fetch_order = read
+    v.ex.cancel_order = cancel
+    st = v.cancel_order(btc, "O7")
+    assert cancels == ["O7", "O7"] and st.filled == pytest.approx(0.02) and not st.is_open
+
+
+def test_kraken_order_whose_reply_was_lost_is_found_by_our_id(monkeypatch):
+    import funding_capture.venues.ccxt_venue as cv
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    placed = {}
+
+    def create(symbol, type_, side, amount, price, params):
+        placed["cid"] = params["clientOrderId"]
+        raise ccxt.RequestTimeout("reply lost; Kraken took the order")
+
+    v.ex.create_order = create
+    v.ex.fetch_open_orders = lambda symbol, since, limit, params: (
+        [{"id": "O9", "status": "open", "filled": 0.0}]
+        if params.get("clientOrderId") == placed["cid"]
+        else []
+    )
+    v.ex.fetch_closed_orders = lambda *a: []
+    assert v.place_post_only(btc, "buy", 0.01, 59_000) == "O9"  # carried on with, not lost
+    v.ex.fetch_open_orders = lambda *a: []  # never placed: the error is raised
+    with pytest.raises(ccxt.RequestTimeout):
+        v.place_post_only(btc, "buy", 0.01, 59_000)

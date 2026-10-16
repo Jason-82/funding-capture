@@ -339,3 +339,37 @@ def test_halted_perp_is_not_traded_but_its_position_is_still_read():
     api.positions[0]["side"] = "SOMETHING_NEW"
     with pytest.raises(ValueError, match="unexpected side"):
         v.fetch_perp_positions()  # unknown, never guessed as long
+
+
+def test_ioc_fill_is_confirmed_and_a_lost_reply_is_resent_safely(cb, monkeypatch):
+    import funding_capture.venues.coinbase as cbmod
+
+    monkeypatch.setattr(cbmod.time, "sleep", lambda s: None)
+    monkeypatch.setattr("funding_capture.venues.ccxt_venue.time.sleep", lambda s: None)
+    v, insts = cb
+    shib = insts["SHP-20DEC30-CDE"]
+    api = v.ex
+    real_post, posts = api.v3PrivatePostBrokerageOrders, []
+
+    def lossy_post(body):
+        posts.append(body["client_order_id"])
+        if len(posts) == 1:
+            raise ccxt.RequestTimeout("reply lost")
+        return real_post(body)
+
+    api.v3PrivatePostBrokerageOrders = lossy_post
+    real_get, gets = api.v3PrivateGetBrokerageOrdersHistoricalOrderId, []
+
+    def flaky_get(params):
+        gets.append(1)
+        if len(gets) == 1:
+            raise ccxt.RequestTimeout("read timed out")
+        return real_get(params)
+
+    api.v3PrivateGetBrokerageOrdersHistoricalOrderId = flaky_get
+    f = v.place_ioc(shib, "buy", 20_000_000, 0.0000056)
+    assert posts[0] == posts[1]  # the same client_order_id: Coinbase won't place it twice
+    assert f.qty == pytest.approx(20_000_000)  # confirmed despite a failed read
+    api.v3PrivateGetBrokerageOrdersHistoricalOrderId = lambda params: {"order": {}}
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)

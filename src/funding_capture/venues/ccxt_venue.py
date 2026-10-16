@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import time
+import uuid
 
 from ..models import (
     Fill,
@@ -430,8 +431,16 @@ class CcxtVenue(Venue):
         params: dict = {**_ORDER_PARAMS.get(self.ex.id, {}), "postOnly": True}
         if reduce_only and inst.is_perp:
             params["reduceOnly"] = True
+        cid = self._client_id(params)
         try:
             order = self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params)
+        except ccxt.NetworkError:
+            # the exchange may have taken the order although the reply was lost: find it
+            # by our id and carry on with it (or confirm it isn't there) before giving up
+            found = self._find_by_client_id(inst, cid) if cid else None
+            if found is None:
+                raise
+            order = found
         except ccxt.OrderImmediatelyFillable:
             return None
         except ccxt.InvalidOrder as exc:  # venues word "would cross" rejections differently
@@ -442,21 +451,73 @@ class CcxtVenue(Venue):
             if "POST_ONLY" in str(exc):
                 return None
             raise
-        if order.get("status") in ("canceled", "cancelled", "rejected", "expired"):
+        ended = order.get("status") in ("canceled", "cancelled", "rejected", "expired")
+        if ended and not float(order.get("filled") or 0.0):
             return None  # some venues accept then cancel a post-only that would cross
         return str(order["id"])
 
     def fetch_order_state(self, inst, order_id) -> OrderState:
-        return self._order_state(inst, self.ex.fetch_order(order_id, inst.symbol))
+        order = self._retry(lambda: self.ex.fetch_order(order_id, inst.symbol), "fetch_order")
+        return self._order_state(inst, order)
 
     def cancel_order(self, inst, order_id) -> OrderState:
         import ccxt
 
-        # an order that already filled or is gone can make the cancel itself fail; the
-        # order's own state below is what counts
-        with contextlib.suppress(ccxt.OrderNotFound, ccxt.BadRequest, ccxt.InvalidOrder):
-            self.ex.cancel_order(order_id, inst.symbol)
+        def cancel() -> None:
+            # an order that already filled or is gone can make the cancel itself fail;
+            # the order's own state below is what counts (a repeated cancel is harmless)
+            quiet = (ccxt.OrderNotFound, ccxt.BadRequest, ccxt.InvalidOrder, ccxt.CancelPending)
+            with contextlib.suppress(*quiet):
+                self.ex.cancel_order(order_id, inst.symbol)
+
+        self._retry(cancel, "cancel_order")
         return self._settled(inst, order_id)
+
+    def _retry(self, fn, what: str, tries: int = 5):
+        """Retry a call that is safe to repeat (a read, a cancel) through short network
+        trouble: timeouts, 5xx, Kraken's EService:Unavailable/Busy (0.5, 1, 2, 4 s)."""
+        import ccxt
+
+        for i in range(tries):
+            try:
+                return fn()
+            except ccxt.NetworkError as exc:
+                if i == tries - 1:
+                    raise
+                log.warning("%s: %s failed (%s); retrying", self.name, what, exc)
+                time.sleep(0.5 * 2**i)
+        return None
+
+    def _client_id(self, params: dict) -> str | None:
+        """Tag an order with our own id where the venue lets us look it up by it, so an
+        order whose create reply was lost can still be found (Kraken: cl_ord_id)."""
+        if self.ex.id != "kraken":
+            return None
+        cid = str(uuid.uuid4())
+        params["clientOrderId"] = cid
+        return cid
+
+    def _find_by_client_id(self, inst: Instrument, cid: str) -> dict | None:
+        """The order we tagged with ``cid``, open or closed, or None once it is clear
+        that the exchange never took it. Raises if that can't be established."""
+        import ccxt
+
+        p = {"clientOrderId": cid}
+        for i in range(5):
+            if i:
+                time.sleep(0.5 * 2 ** (i - 1))
+            try:
+                hits = self.ex.fetch_open_orders(inst.symbol, None, None, dict(p))
+                hits = hits or self.ex.fetch_closed_orders(inst.symbol, None, None, dict(p))
+            except ccxt.NetworkError as exc:
+                log.warning("%s: looking up order %s failed: %s", self.name, cid, exc)
+                continue
+            if hits:
+                log.warning("%s: order %s was placed although its reply was lost", self.name, cid)
+                return hits[0]
+            if i >= 2:  # asked three times with no network error: it isn't there
+                return None
+        raise RuntimeError(f"{self.name}: could not tell whether order {cid} was placed")
 
     def _settled(self, inst, order_id, tries: int = 6, pause_s: float = 0.5) -> OrderState:
         """Read an order until the venue reports it closed (cancels can be asynchronous).
@@ -522,8 +583,14 @@ class CcxtVenue(Venue):
             params["reduceOnly"] = True
         import ccxt
 
+        cid = self._client_id(params)
         try:
             order = self.ex.create_order(inst.symbol, "limit", order_side, amount, price, params)
+        except ccxt.NetworkError:
+            found = self._find_by_client_id(inst, cid) if cid else None
+            if found is None:
+                raise
+            order = found
         except ccxt.InvalidOrder as exc:
             # Hyperliquid reports an IOC with nothing to match as an error, not a 0 fill
             if "immediately match" in str(exc).lower():

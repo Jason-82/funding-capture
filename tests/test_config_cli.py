@@ -317,3 +317,36 @@ def test_forget_drops_a_pair_closed_by_hand(tmp_path, capsys):
     data = load_json(path)
     assert data["positions"] == [] and data["closed"][0]["id"] == "P1"
     assert "fcap forget" in data["closed"][0]["notes"][-1]
+
+
+def test_status_counts_the_cost_of_closing_open_pairs(tmp_path, capsys):
+    import time
+
+    from funding_capture.models import Candidate, PairPosition
+    from funding_capture.state import position_to_dict, save_json
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n  capital_usd: 1000\n")
+    pos = PairPosition(
+        "P1",
+        Candidate(Construction.SPOT_PERP, "BTC", spot("k"), perp("h")),
+        5.0,
+        100.0,
+        100.0,
+        T0,
+        funding_usd=5.0,
+    )
+    save_json(
+        tmp_path / "state" / "paper" / "engine.json",
+        {
+            "positions": [position_to_dict(pos)],
+            "closed": [],
+            "started_ms": int(time.time() * 1000) - 10 * 86_400_000,
+            "capital_usd": 1000,
+        },
+    )
+    main(["-c", str(cfg), "status"])
+    out = capsys.readouterr().out
+    assert "estimated cost to close the open pairs: $" in out
+    line = next(x for x in out.splitlines() if x.startswith("annualised"))
+    assert "+18.3%" not in line  # $5 in 10 days would be +18.3% if closing were free

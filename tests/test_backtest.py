@@ -140,3 +140,13 @@ def test_settlement_intervals_follow_changes_and_survive_holes():
     assert s["interval"].tolist() == [8, 8, 8, 4, 4, 4, 4, 4]
     assert s["hourly"].iloc[0] == pytest.approx(0.0001)
     assert s["hourly"].iloc[-1] == pytest.approx(0.0002)
+
+
+def test_backtest_respects_max_position_usd():
+    pa, pb = perp("a"), perp("b")
+    series = {
+        pa.key: settlement_frame(T0, 30 * 24, 8, lambda i: 0.0005),
+        pb.key: settlement_frame(T0, 30 * 24, 8, lambda i: 0.0001),
+    }
+    tr = _bt(series, [pa, pb], max_position_usd=600).run().trades
+    assert tr.iloc[0]["notional_usd"] == pytest.approx(600)  # as the engine sizes it

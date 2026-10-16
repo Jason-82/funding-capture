@@ -362,7 +362,15 @@ class PairExecutor:
                         break
                 finally:
                     if resting:  # never leave our order on the book when we stop looking
-                        final = vm.cancel_order(m.inst, oid)
+                        try:
+                            final = vm.cancel_order(m.inst, oid)
+                        except Exception:
+                            rep.messages.append(
+                                f"order {oid} on {m.inst.key} may still be open, and fills since "
+                                f"the last check are NOT recorded: check open orders and the "
+                                f"{m.inst.asset} balance on {m.inst.venue}"
+                            )
+                            raise
                         if not self._absorb(m, h, final, seen, carry, rep, hedge=not failed):
                             failed, reason = True, "hedge failed"
                         if final.is_open:

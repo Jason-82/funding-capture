@@ -20,6 +20,7 @@ Start with one contract and check every field ``fcap check`` prints.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -33,7 +34,7 @@ from .ccxt_venue import CcxtVenue
 
 log = logging.getLogger(__name__)
 
-_OPEN_STATES = {"OPEN", "PENDING", "QUEUED", "CANCEL_QUEUED"}
+_FINAL_STATES = {"FILLED", "CANCELLED", "EXPIRED", "FAILED"}  # anything else may still fill
 
 
 def _f(value, default: float = 0.0) -> float:
@@ -291,20 +292,28 @@ class CoinbaseVenue(CcxtVenue):
         cfg = {"base_size": str(int(contracts)), "limit_price": limit_px}
         if config_name == "limit_limit_gtc":
             cfg["post_only"] = post_only
-        try:
-            return self.ex.v3PrivatePostBrokerageOrders(
-                {
-                    "client_order_id": f"fc-{uuid.uuid4()}",
-                    "product_id": inst.symbol,
-                    "side": side.upper(),
-                    "order_configuration": {config_name: cfg},
-                }
-            )
-        except ccxt.ExchangeError as exc:
-            body = _json_in(str(exc))
-            if isinstance(body, dict) and ("error_response" in body or "success" in body):
-                return body
-            raise
+        body = {
+            "client_order_id": f"fc-{uuid.uuid4()}",
+            "product_id": inst.symbol,
+            "side": side.upper(),
+            "order_configuration": {config_name: cfg},
+        }
+        for attempt in range(4):
+            try:
+                # resending the same client_order_id returns the existing order instead of
+                # placing a second one, so a reply lost to a timeout is safe to retry
+                return self.ex.v3PrivatePostBrokerageOrders(body)
+            except ccxt.NetworkError as exc:
+                if attempt == 3:
+                    raise
+                log.warning("coinbase order %s: %s; resending", body["client_order_id"], exc)
+                time.sleep(1.0)
+            except ccxt.ExchangeError as exc:
+                err = _json_in(str(exc))
+                if isinstance(err, dict) and ("error_response" in err or "success" in err):
+                    return err
+                raise
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _order_id(resp: dict) -> tuple[str | None, str]:
@@ -315,12 +324,11 @@ class CoinbaseVenue(CcxtVenue):
         return (ok if resp.get("success", bool(ok)) else None), reason.strip()
 
     def _state(self, inst: Instrument, order_id: str) -> OrderState:
-        o = (
-            self.ex.v3PrivateGetBrokerageOrdersHistoricalOrderId({"order_id": order_id}).get(
-                "order"
-            )
-            or {}
+        reply = self._retry(
+            lambda: self.ex.v3PrivateGetBrokerageOrdersHistoricalOrderId({"order_id": order_id}),
+            "order read",
         )
+        o = (reply or {}).get("order") or {}
         filled = _f(o.get("filled_size")) * self._unit(inst)
         avg = _f(o.get("average_filled_price"))
         return OrderState(
@@ -328,8 +336,37 @@ class CoinbaseVenue(CcxtVenue):
             filled,
             avg / inst.multiplier if avg else None,
             _f(o.get("total_fees")),
-            str(o.get("status", "")).upper() in _OPEN_STATES,
+            str(o.get("status", "")).upper() not in _FINAL_STATES,  # unknown: may still fill
         )
+
+    def _confirm(self, inst: Instrument, oid: str, tries: int = 6) -> OrderState:
+        """The final state of an IOC; cancels it if it still looks open. Never assumes
+        "nothing filled": raises if the fill can't be confirmed (the executor then treats
+        the trade as unsafe and halts entries)."""
+
+        def read() -> OrderState | None:
+            st = None
+            for i in range(tries):
+                if i:
+                    time.sleep(0.5)
+                try:
+                    st = self._state(inst, oid)
+                except Exception as exc:
+                    log.warning("coinbase: reading order %s failed: %s", oid, exc)
+                    continue
+                if not st.is_open:
+                    return st
+            return st
+
+        st = read()
+        if st is not None and not st.is_open:
+            return st
+        with contextlib.suppress(Exception):
+            self.ex.v3PrivatePostBrokerageOrdersBatchCancel({"order_ids": [oid]})
+        st = read()
+        if st is None or st.is_open:
+            raise RuntimeError(f"coinbase: IOC {oid} fill could not be confirmed")
+        return st
 
     def place_ioc(self, inst, order_side, qty, limit_price, reduce_only=False) -> Fill:
         if not inst.is_perp:
@@ -355,14 +392,7 @@ class CoinbaseVenue(CcxtVenue):
             oid, reason = self._order_id(resp)
         if oid is None:
             raise RuntimeError(f"coinbase order rejected: {reason or resp}")
-        st = self._state(inst, oid)
-        for _ in range(10):  # IOC/FOK resolve at once; allow a moment for the record
-            if not st.is_open:
-                break
-            time.sleep(0.3)
-            st = self._state(inst, oid)
-        if st.is_open:
-            st = self.cancel_order(inst, oid)
+        st = self._confirm(inst, oid)
         return Fill(inst, order_side, st.filled, st.avg_price or limit_price, st.fee_usd, oid)
 
     def place_post_only(self, inst, order_side, qty, price, reduce_only=False):
@@ -396,7 +426,10 @@ class CoinbaseVenue(CcxtVenue):
     def cancel_order(self, inst, order_id) -> OrderState:
         """Cancel via batch_cancel (its per-order result is ignored: an order that just
         filled 'fails' to cancel) and return the confirmed final state, fills included."""
-        self.ex.v3PrivatePostBrokerageOrdersBatchCancel({"order_ids": [order_id]})
+        self._retry(  # a repeated cancel is harmless
+            lambda: self.ex.v3PrivatePostBrokerageOrdersBatchCancel({"order_ids": [order_id]}),
+            "cancel",
+        )
         return self._settled(inst, order_id)
 
     def fetch_perp_positions(self) -> dict[str, PerpPositionInfo]:

@@ -909,8 +909,29 @@ class Engine:
             ex.qty(c.long, "buy") - ex.qty(c.long, "sell"),
             ex.qty(c.short, "sell") - ex.qty(c.short, "buy"),
         )
+        unwound = 0.0  # price P&L of what was bought or sold and then traded back
+        for inst, side, back, sgn in ((c.long, "buy", "sell", 1), (c.short, "sell", "buy", -1)):
+            first, then = ex.avg_price(inst, side), ex.avg_price(inst, back)
+            if first and then:
+                unwound += sgn * ex.qty(inst, back) * (then - first)
         if qty <= 0 or long_px is None or short_px is None:
             log.info("open %s: nothing hedged (%s)", c.key, "; ".join(ex.messages))
+            if ex.fills and not ex.has_residual:  # traded and traded back: record the cost
+                self._seq += 1
+                self.closed.append(
+                    PairPosition(
+                        id=f"P{now // 1000}-{self._seq}",
+                        candidate=c,
+                        qty=0.0,
+                        long_entry=long_px or 0.0,
+                        short_entry=short_px or 0.0,
+                        opened_ms=now,
+                        closed_ms=now,
+                        entry_fees_usd=ex.fees_usd,
+                        realized_price_usd=unwound,
+                        notes=["open unwound: " + "; ".join(ex.messages)],
+                    )
+                )
             if ex.fees_usd > 0:  # paid to buy and sell back: don't repeat it every step
                 until = now + int(self.cfg.risk_cooldown_minutes * 60_000)
                 for inst in (c.long, c.short):
@@ -925,6 +946,7 @@ class Engine:
             short_entry=short_px,
             opened_ms=now,
             entry_fees_usd=ex.fees_usd,
+            realized_price_usd=unwound,  # e.g. a partial fill traded back
             notes=[f"opened at {s.net_apr_on_capital:.1%} expected net APR"] + ex.messages,
         )
         self.positions[pos.id] = pos

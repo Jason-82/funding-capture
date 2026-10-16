@@ -38,6 +38,7 @@ class BacktestConfig:
     max_positions: int = 5
     max_positions_per_asset: int = 1
     min_position_usd: float = 100.0
+    max_position_usd: float = math.inf  # notional per pair, as portfolio.max_position_usd
     warmup_hours: int = 72
     # Ignore entries where a leg prints above this |APR|; such prints are usually squeezes
     # in thin markets that a backtest cannot trade realistically. None disables.
@@ -293,15 +294,16 @@ class Backtester:
                         budget = min(
                             cfg.capital_usd / cfg.max_positions, cfg.capital_usd - used_capital
                         )
-                        notional = budget / arr["cap"][ci]
+                        notional = min(cfg.max_position_usd, budget / arr["cap"][ci])
                         if notional < cfg.min_position_usd:
                             break
+                        capital = notional * arr["cap"][ci]
                         entry_cost = notional * arr["rtc"][ci] / 2
                         cash -= entry_cost
-                        open_pos[next(next_id)] = _Open(ci, notional, budget, t, costs=entry_cost)
+                        open_pos[next(next_id)] = _Open(ci, notional, capital, t, costs=entry_cost)
                         held_assets[a] = held_assets.get(a, 0) + 1
                         used_insts.update(cand_insts[ci])
-                        used_capital += budget
+                        used_capital += capital
 
             # mark-to-market: open positions are worth cash minus their (unpaid) exit cost
             pending_exit = sum(p.notional * arr["rtc"][p.cand_idx] / 2 for p in open_pos.values())
