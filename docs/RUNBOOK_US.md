@@ -1,377 +1,520 @@
-# Runbook: running funding-capture step by step (US)
+# Runbook: funding-capture from the US, step by step
 
-Everything here runs **on your own computer** (or a small always-on server). The cloud
-sandbox this was built in can't reach exchange APIs, so none of these commands have been
-run against a live exchange yet. Steps 3 and 9 exist to catch that early, with no money
-or with one contract.
+Everything runs **on your own computer** (or a small always-on server). The cloud
+sandbox this was built in can't reach exchanges, so the bot has not yet talked to a real
+exchange. The plan below finds problems with no money at risk first.
 
-`$` lines are commands to paste into a terminal, from the project folder, with the
-virtual environment active (step 1). Venue facts below were researched on 2026-10-15 and
-change often: fees especially. The bot prints your real fees in step 8.
+**How to read this:** lines starting with `$` are commands. Type or paste them into
+Terminal **without** the `$`, then press Enter. "You should see" describes the expected
+output. If you see something else, copy the whole Terminal output into the Claude chat
+and ask what to do.
 
----
+**The plan at a glance**
 
-## 0. What you can trade from the US
+| Phase | When | Time | Money at risk |
+|---|---|---|---|
+| 1. Install, look around, start recording + paper trading | today | ~45 min | none |
+| 2. Let it run; check daily; backtest; decide | next 2–4 weeks | 5 min/day | none |
+| 3. Exchange accounts and API keys | after a "go" in phase 2 | ~45 min | none |
+| 4. One live contract, then scale slowly | the week after | a few days | small |
 
-| Venue | What the bot uses it for | Status for a US person |
-|---|---|---|
-| **Coinbase** (Advanced) | spot long legs **and** the short perp leg: CFTC-regulated "perpetual-style" futures on ~20 coins (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX, LTC, DOT, XLM, HBAR, SUI, BCH, NEAR, AAVE, ONDO, ENA, 1000SHIB, 1000PEPE, ZEC…), funding every hour | ✅ needs futures onboarding in the Coinbase app |
-| **Kraken Pro** | spot long legs (lots of alts) | ✅ spot. Not available in NY or ME; no crypto withdrawals from IN |
-| Kraken US perps (Bitnomial) | – | exist (9–16 majors, 8h funding) but no retail API, so the bot can't trade them |
-| Kalshi | – | has had BTC/ETH/SOL/XRP/HYPE perps since June 2026 (8h funding), but no ccxt support and API access is invite-by-invite; possible future adapter |
-| Hyperliquid, Lighter | – | ❌ their terms of use exclude US persons (Hyperliquid §1.6, updated 2026-06-15; Lighter's terms cover its API too) |
-
-So the US version of the trade is: **buy the coin spot on Kraken or Coinbase, short the
-same coin's Coinbase perp, and collect the hourly funding while it is positive.**
-
-**Read this before you spend time on it. The economics are tougher than offshore:**
-
-* **Spot fees are high.** Coinbase Intro tier: 0.50% maker / 0.90% taker. Kraken Tier 1:
-  reportedly 0.40% / 0.80%. The bot rests post-only (maker) orders on the spot leg, so a
-  round trip still costs ~0.8–1.0% plus perp fees. That's why the US config plans to hold
-  a position about a month and only enters when expected funding clearly beats that.
-* **Capital efficiency is poor.** The spot coins are fully paid for, and Coinbase holds
-  30–95% of notional as overnight margin on short alt perps. A $1,000 pair ties up about
-  $2,000, so a 30% funding APR is roughly 15% on your capital *before* fees.
-* **Fewer markets.** About 20 perps, some with $1–2M/day volume.
-
-Kraken's fees drop with "assets on platform" (e.g. ~$20k held moves you to ~0.22% maker),
-and Coinbase tiers drop with volume or USDC balance. Better tiers change the answer a lot.
-Run steps 4–6 before funding anything.
+What the bot trades (US-legal venues only): **buy a coin spot on Kraken or Coinbase,
+short the same coin's Coinbase US perpetual-style future, and collect the hourly funding
+while it is positive.** Section [Background](#background-what-you-can-trade-from-the-us)
+at the end explains why Hyperliquid and Lighter are not used and what the economics look
+like.
 
 ---
 
-## 1. Install (once)
+## Phase 1: today
 
-**macOS**
+### Step 1. Open Terminal
 
-```bash
-$ xcode-select --install          # only if `git --version` says git is missing
-$ brew install python@3.12        # or install Python 3.11+ from python.org
-$ git clone https://github.com/Jason-82/funding-capture.git
-$ cd funding-capture
-$ git checkout claude/busy-maxwell-hiuy46     # until this branch is merged to main
+macOS: press **⌘ + Space**, type `Terminal`, press Enter. Keep this window open for
+the rest of Phase 1.
+
+*Windows:* first install WSL. Open **PowerShell as Administrator**, run `wsl --install`,
+restart, then open the **Ubuntu** app from the Start menu. Use the Ubuntu window as your
+Terminal. Everywhere below, run `sudo apt update && sudo apt install -y python3.12
+python3.12-venv git tmux gh` instead of the `brew` lines.
+
+### Step 2. Install the tools (once)
+
+1. Install Homebrew (the macOS package manager), if `brew --version` says "command not
+   found":
+
+   ```
+   $ /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+   It asks for your Mac password (nothing shows while typing; that's normal). When it
+   finishes it prints **"Next steps"** with two `echo …` / `eval …` lines: copy and run
+   those two lines.
+
+2. Install Python 3.12, GitHub's command-line tool, and tmux (keeps programs running
+   after you close the window):
+
+   ```
+   $ brew install python@3.12 gh tmux
+   ```
+
+3. Check:
+
+   ```
+   $ python3.12 --version
+   ```
+
+   You should see `Python 3.12.x`.
+
+### Step 3. Download the code
+
+1. Log in to GitHub (the repository is yours and may be private):
+
+   ```
+   $ gh auth login
+   ```
+
+   Choose: **GitHub.com** → **HTTPS** → **Yes** (authenticate Git) → **Login with a web
+   browser**. Copy the one-time code it shows, press Enter, paste the code in the
+   browser page and approve.
+
+2. Download the project into your home folder and switch to the branch with this work:
+
+   ```
+   $ cd ~
+   $ gh repo clone Jason-82/funding-capture
+   $ cd funding-capture
+   $ git checkout claude/busy-maxwell-hiuy46
+   ```
+
+   You should see `Switched to a new branch 'claude/busy-maxwell-hiuy46'`.
+
+### Step 4. Install the bot
+
+```
 $ python3.12 -m venv .venv
-$ source .venv/bin/activate       # do this in every new terminal before using fcap
+$ source .venv/bin/activate
 $ pip install -e ".[dev]"
-$ pytest -q                       # should end with "... passed"
+$ pytest -q
 ```
 
-**Windows:** easiest is WSL (PowerShell as admin: `wsl --install`, reboot, open
-"Ubuntu"), then the same commands, with `sudo apt install python3-venv git` instead of
-brew. Native Windows also works: Python 3.12 from python.org, `py -3.12 -m venv .venv`,
-then `.venv\Scripts\Activate.ps1`.
+* After `source …` your prompt starts with `(.venv)`. **Every time you open a new
+  Terminal window for this project, run these two lines first:**
+  `cd ~/funding-capture` and `source .venv/bin/activate`.
+* `pip install` prints a lot and ends with `Successfully installed …`.
+* `pytest -q` should end with **`96 passed`** (the number may be higher after updates).
 
-Updating later: `git pull`, then `pip install -e ".[dev]"`.
+### Step 5. Create your settings file
 
-## 2. Create your config
-
-```bash
+```
 $ cp config.us.yaml config.yaml
+$ mkdir -p logs
 ```
 
-`config.yaml` is git-ignored, so your edits stay local. Every setting is commented. The
-ones that matter first:
+You don't need to change anything yet. `config.yaml` is yours (git never uploads it).
 
-| Key | What it does |
-|---|---|
-| `fees` | your **actual** fee tier per venue (step 8 prints it); decides which trades pass |
-| `costs.maker_venues` | spot legs on these venues are worked with post-only orders |
-| `costs.perp_leverage` | 1.0 = budget margin equal to the perp notional (safe for alts overnight) |
-| `strategy.entry_apr` | minimum expected APR **on capital**, after all fees, to open a pair |
-| `strategy.horizon_hours` | how long a position is expected to be held when judging entry |
-| `portfolio.capital_usd`, `max_position_usd`, `max_positions` | sizing |
-| `portfolio.min_volume_usd` | skip coins with less 24h volume than this on either leg |
+### Step 6. Check that both exchanges answer (no keys needed)
 
-## 3. Check connectivity (no keys needed)
-
-```bash
+```
 $ fcap -c config.yaml check
 ```
 
-Expected, per venue: `ok markets: N perps, M spot markets`, `ok funding: …/1h` for
-Coinbase, `ok quotes: …`, then `skip account checks (no API credentials…)`.
+You should see something like this (numbers will differ):
 
-For **coinbase**, `markets` should report around 20 perps. Zero perps means Coinbase
-changed something in its product list; tell me and I'll adapt `venues/coinbase.py`.
-The funding lines should show small hourly rates such as `+0.000020/1h` (0.002% per hour
-≈ 17.5% APR).
-
-## 4. Look at live opportunities
-
-```bash
-$ fcap -c config.yaml scan --top 30
-$ fcap -c config.yaml scan --top 30 --all     # include pairs failing volume/spread filters
+```
+coinbase  (ccxt id: coinbase; credentials: none)
+  ok    markets: 22 perps, 350 spot markets
+  ok    funding: BTC +0.000004/1h, ETH +0.000011/1h, SOL +0.000020/1h
+  ok    quotes: BIP-20DEC30-CDE 108000/108005, …
+  skip  account checks (no API credentials in the environment)
+kraken  (ccxt id: kraken; credentials: none)
+  ok    markets: 0 perps, 600 spot markets
+  ok    quotes: …
+  skip  account checks (no API credentials in the environment)
 ```
 
-Columns:
+* **About 20 perps on Coinbase** is the important part. `0 perps` means Coinbase
+  changed its product list: paste the output to Claude.
+* Funding like `+0.000020/1h` is per hour: × 8,760 ≈ 17.5% a year.
+* Any `FAIL` line: retry once; if it persists, paste it to Claude.
 
-* **long leg / short leg**: e.g. `kraken:spot` / `coinbase:perp`
-* **gross now**: current funding APR on notional, before costs
-* **fcst**: forecast funding APR over the hold horizon (funding fades)
-* **net/cap**: forecast APR **on capital** after round-trip fees; the number that matters
-* **b/e h**: hours the position needs to pay back its fees
-* **vol $M**: the smaller 24h volume of the two legs
-* **div**: price disagreement between the legs (should be ~0)
-* `*`: passes your entry rules
+### Step 7. See what's available right now
 
-Run it a few times a day for a few days to get a feel for it.
-
-## 5. Build funding history
-
-Coinbase has no API for past funding, so history comes from two places:
-
-**(a) Start recording now, and leave it running** (cheap: one API call every 10 min):
-
-```bash
-$ mkdir -p logs
-$ fcap -c config.yaml --log-file logs/record.log record
 ```
-
-Run it in `tmux` (see step 7) or on a server so it keeps going. It stores each hourly
-settlement under `data/coinbase/funding/`.
-
-**(b) Import Coinbase's downloadable history.** Coinbase's derivatives funding-rate page
-(coinbase.com → Derivatives → funding rates / market data) offers recent hourly history
-(~90 days) as a CSV. For each perp you care about:
-
-```bash
-$ fcap -c config.yaml import-funding --venue coinbase --symbol BIP-20DEC30-CDE \
-      --file ~/Downloads/BIP_funding.csv
-```
-
-The importer guesses the time and rate columns. If a column name doesn't contain "time"
-or "rate", pass `--time-col` / `--rate-col`. It handles `%` values. Check the printed
-first/last rows: rates should look like `2e-05` (hourly fractions), **not** `0.002`
-(percent). If they're percents without a `%` sign, re-run with `--percent`. List the product
-ids (BIP-…, ETP-…, DOP-…) and what one contract is worth with:
-
-```bash
 $ fcap -c config.yaml markets --venue coinbase --kind perp
+$ fcap -c config.yaml scan --top 30 --all
 ```
 
-The date part of an id (`-20DEC30-`) changes when Coinbase lists a successor contract.
+`markets` lists each Coinbase perp's id (like `DOP-20DEC30-CDE` for DOGE), how many coins
+one contract is, and what one contract is worth in dollars.
 
-## 6. Backtest and tune
+`scan` ranks every Kraken-or-Coinbase-spot + Coinbase-perp pair. Columns:
 
-```bash
+| Column | Meaning |
+|---|---|
+| `gross now` | funding right now, as a yearly rate on the position's size |
+| `fcst` | what the bot expects funding to average over a month (it fades) |
+| `net/cap` | **expected yearly return on the money it ties up, after all fees**: the number that matters |
+| `b/e h` | hours the pair must be held to earn back its fees |
+| `vol $M` | 24h trading volume (the smaller leg), in $ millions |
+| `ok` | `*` = passes your entry rules today |
+
+Don't worry if nothing has a `*`; funding moves with the market. This is just to get a
+feel for it.
+
+### Step 8. Start recording funding and paper trading (leave them running)
+
+Coinbase doesn't publish funding history through its API, so the bot records it from
+now on. At the same time it paper trades: real prices, real funding, **simulated**
+orders. No keys, no money.
+
+1. Start the recorder in its own background session:
+
+   ```
+   $ tmux new -s record
+   ```
+
+   The window clears (you're now "inside" tmux). Run:
+
+   ```
+   $ cd ~/funding-capture && source .venv/bin/activate
+   $ fcap -c config.yaml --log-file logs/record.log record
+   ```
+
+   You should see `recorded 22 funding readings` (about every 10 minutes). Now
+   **detach**: press **Ctrl + b**, let go, then press **d**. You're back in your normal
+   window and the recorder keeps running.
+
+2. Start paper trading the same way:
+
+   ```
+   $ tmux new -s paper
+   $ cd ~/funding-capture && source .venv/bin/activate
+   $ fcap -c config.yaml --log-file logs/paper.log paper
+   ```
+
+   You should see `bootstrapped: … instruments, … candidates, 0 open positions`, then
+   every minute a `best: spot_perp …` line and `open positions: …`. Detach with
+   **Ctrl + b**, then **d**.
+
+3. Keep the Mac awake while these run (plugged in, lid open):
+
+   ```
+   $ tmux new -d -s awake 'caffeinate -dims'
+   ```
+
+To look at a session later: `tmux attach -t paper` (or `record`). Detach again with
+Ctrl + b, d. To list sessions: `tmux ls`. If you restart the Mac, repeat step 8. The bot
+picks up where it left off.
+
+**Phase 1 done.**
+
+---
+
+## Phase 2: the next 2–4 weeks
+
+### Every day (5 minutes)
+
+Open Terminal, then:
+
+```
+$ cd ~/funding-capture && source .venv/bin/activate
+$ tmux ls                                    # should list: awake, paper, record
+$ fcap -c config.yaml status                 # paper positions and results
+$ grep -ciE "critical|error|halted" logs/paper.log   # ideally 0
+```
+
+`status` shows open pairs (coin, venues, size, funding earned, fees), closed pairs with
+their net result, and once a day has passed:
+
+```
+running for 9.2 days on $5,000 of capital
+annualised return on capital so far: +12.4%  (noisy until a few weeks have passed)
+```
+
+If `tmux ls` is missing `paper` or `record`, restart it as in step 8. If the error count
+grows, run `grep -iE "critical|error|halted" logs/paper.log | tail -20` and paste the
+output to Claude.
+
+### After 2 weeks: first backtest on the recorded data
+
+```
 $ fcap -c config.yaml backtest --trades trades.csv
+```
+
+This replays the recorded funding with your settings. Read: `net pnl`, **`APR on
+capital`**, `funding / costs`, number of trades. `trades.csv` opens in Numbers or Excel.
+Two weeks is short, so treat it as a sanity check, not a verdict.
+
+### After 4 weeks: tune and decide
+
+```
 $ fcap -c config.yaml sweep
 ```
 
-* `backtest` prints net P&L, **APR on capital**, the funding vs. fees split, win rate,
-  average hold, how much capital was working, max drawdown, and a per-coin breakdown.
-  `trades.csv` lists every simulated trade.
-* `sweep` tries a grid of entry/exit/horizon/forecast settings. It picks on the first
-  half of the data and reports the second half (`test_apr_pct`). Use settings that are
-  good **and stable** in the test column; avoid the single best training row. Copy them
-  into `config.yaml` under `strategy:`.
+This tries many settings: it picks on the first half of the data and scores on the
+second half (`test_apr_pct`). Paste the output to Claude if you want help choosing.
+Change settings with `nano config.yaml`: arrow keys to move, edit, **Ctrl + O** then
+Enter to save, **Ctrl + X** to exit. The paper engine reads settings at start, so
+restart it (attach, **Ctrl + c**, run the `fcap … paper` line again, detach).
 
-Limitations, with ~90 days of data: few trades, so treat results as rough. The backtest
-also ignores Coinbase's per-contract minimum fee (the scanner and engine include it), the
-price gap between legs, and whether maker orders fill.
+**Decision rule** (from `status` and the backtest):
 
-**Go / no-go:** continue only if the test-half APR on capital clearly beats parking cash
-in a money-market/USDC yield, plus a premium for exchange risk (~10% APR above it).
+| Paper result, annualised on capital | What to do |
+|---|---|
+| above ~15% and the backtest agrees | go to Phase 3 |
+| 5–15% | keep paper trading; consider better fee tiers (see Background) |
+| below ~5% or negative | stop here; a savings account beats it with less risk |
 
-## 7. Paper trade (2–4 weeks)
+Paper fills of the spot leg are a bit optimistic (real maker orders queue), so live will
+usually come in lower than paper.
 
-Paper mode uses live prices and funding with simulated fills, at the fees in your
-config. It needs no keys and places no orders.
+---
 
-```bash
-$ tmux new -s paper                        # keeps running after you close the terminal
-$ source .venv/bin/activate
-$ fcap -c config.yaml --log-file logs/paper.log paper
-# detach: Ctrl-b then d      re-attach later: tmux attach -t paper
+## Phase 3: exchange accounts and API keys
+
+Only after a "go". Still no money moves in this phase.
+
+### 3a. Coinbase: turn on futures
+
+1. On coinbase.com (or the app), open **Advanced** trading, find **Futures**
+   (sometimes labelled Derivatives) and choose **Get started** / **Enable**. Answer the
+   questionnaire and accept the agreements. Approval can take a little while.
+2. US futures can only trade from your **Default** portfolio. Use that one for the bot.
+
+### 3b. Coinbase: create the API key
+
+1. Find your public IP address (used to lock the key to your connection):
+
+   ```
+   $ curl -s https://api.ipify.org; echo
+   ```
+
+2. Go to **portal.cdp.coinbase.com** and sign in with your Coinbase account. Open
+   **API keys** → **Secret API keys** → **Create API key**.
+3. Settings:
+   * Nickname: `funding-bot`
+   * Portfolio: **Default**
+   * Permissions: **View** ✅ **Trade** ✅ **Transfer** ❌ (leave off)
+   * IP allowlist: the address from step 1. If your home IP changes often, you can leave
+     this empty; the key still can't move money.
+   * Advanced settings → signature algorithm: **ECDSA**
+4. Create. A file named like `cdp_api_key.json` downloads. Store it in the bot, then
+   delete the download:
+
+   ```
+   $ cd ~/funding-capture && source .venv/bin/activate
+   $ fcap keys coinbase --json ~/Downloads/cdp_api_key.json
+   $ rm ~/Downloads/cdp_api_key.json
+   ```
+
+   You should see `saved COINBASE_API_KEY, COINBASE_SECRET_FILE to .env`.
+
+### 3c. Kraken: create the API key
+
+1. On kraken.com, sign in, click your profile icon → **Settings** → **API** (Kraken Pro:
+   **Settings → API**) → **Create API key**.
+2. Settings:
+   * Name: `funding-bot`
+   * Funds: **Query** ✅, Deposit ❌, **Withdraw ❌**
+   * Orders and trades: **Query open orders & trades** ✅, **Query closed orders &
+     trades** ✅, **Create & modify orders** ✅, **Cancel & close orders** ✅
+   * Everything else off. **No 2FA password on the key** (the bot can't type one).
+   * Advanced: nonce window `10` seconds; IP restriction: same as Coinbase (optional).
+3. **Generate key.** Kraken shows an **API Key** and a **Private Key** once. Keep the
+   page open and run:
+
+   ```
+   $ fcap keys kraken
+   ```
+
+   Paste the API key when asked, then the private key (it stays invisible while you
+   paste; that's normal), Enter after each.
+
+### 3d. Check the keys and set your real fees
+
 ```
-
-(`brew install tmux` if needed. On a laptop, prevent sleep, e.g. run it under
-`caffeinate -i` on macOS.)
-
-From another terminal (venv active):
-
-```bash
-$ fcap -c config.yaml status               # open pairs, funding earned, fees, closed P&L
-$ tail -f logs/paper.log                   # live log; Ctrl-c stops watching
-```
-
-State lives in `state/paper/`, so a restart resumes where it left off. Delete that folder
-to start over.
-
-**Kill switches** (paper uses `state/paper/`, live uses `state/live/`):
-
-```bash
-$ touch state/paper/STOP        # no new pairs; existing ones are still managed
-$ rm state/paper/STOP           # resume
-$ touch state/paper/FLATTEN     # close everything now and stop opening
-```
-
-**After 2–4 weeks, check:**
-
-* realised funding per pair vs. what `scan` expected when it opened
-* fees per round trip vs. config
-* `grep -c "timed out" logs/paper.log`: how often the spot maker order didn't fill in time.
-  Paper fills are optimistic (no queue), so real maker fills will be fewer and slower.
-* any `risk CLOSE` or `CRITICAL` lines, and why
-
-## 8. Accounts and API keys
-
-Use money and accounts you can dedicate to the bot. It assumes it owns every position on
-the instruments it trades, and it will close a hedge leg it thinks is orphaned.
-
-**Coinbase**
-
-1. In the Coinbase app, complete **futures (derivatives) onboarding**. Until then, perp
-   orders fail with HTTP 403.
-2. Optional but wise: Advanced → Portfolios → create a portfolio for the bot's spot
-   coins. Note that **US futures only trade from the Default portfolio**.
-3. Go to portal.cdp.coinbase.com → API keys → **Create Secret API key**:
-   * portfolio: **Default** (needed for futures)
-   * permissions: **View** + **Trade** only, never Transfer
-   * IP allowlist: your machine's public IP
-   * signature algorithm: **ECDSA** (best tested with ccxt)
-4. Save the downloaded key. The key name looks like `organizations/…/apiKeys/…`; the
-   private key is a PEM block. Store the PEM as a file:
-
-```bash
-$ mkdir -p ~/.fcap && chmod 700 ~/.fcap
-# paste the PEM (-----BEGIN EC PRIVATE KEY----- …) into ~/.fcap/coinbase.pem
-$ chmod 600 ~/.fcap/coinbase.pem
-```
-
-**Kraken**
-
-1. Settings → API → **Create key**, used only by this bot (a key shared with another tool
-   causes nonce errors).
-2. Permissions: **Query Funds**, **Query Open Orders & Trades**, **Query Closed Orders &
-   Trades**, **Create & Modify Orders**, **Cancel/Close Orders**. **Not** Withdraw Funds.
-3. Do **not** set a 2FA password on the key (ccxt can't send it). Use the IP allowlist
-   instead. Setting a nonce window of ~10 s helps.
-4. Optional: turn off auto-earn for coins the bot trades, so balances stay simple.
-
-**Put the keys in `.env`** (git-ignored, in the project folder):
-
-```bash
-$ cat > .env <<'EOF'
-COINBASE_API_KEY=organizations/your-org-id/apiKeys/your-key-id
-COINBASE_SECRET_FILE=~/.fcap/coinbase.pem
-KRAKEN_API_KEY=your-kraken-key
-KRAKEN_SECRET=your-kraken-private-key
-EOF
-$ chmod 600 .env
 $ fcap -c config.yaml check
 ```
 
-Now each venue should also show `ok balance: …` and a line like
+Each venue now also shows `ok balance: …` and a fee line like:
 
 ```
   ok    your spot fee: spot_maker: 0.0040  spot_taker: 0.0080  (fractions; paste under fees: kraken:)
 ```
 
-**Paste those two values into `config.yaml`** under `fees:` → that venue. They are
-fractions: 0.0040 means 0.40%. The config refuses percent-style values like `0.4` or
-`0.4%`. Coinbase should also show `ok positions: none` and a `margin buffer` line.
-Re-run `scan` afterwards, because your real fees change which pairs pass.
+Open the config and put those numbers in under `fees:` for that exchange:
 
-## 9. Go live, small
-
-**Fund the accounts.** The bot never moves money between venues; you do that by hand.
-
-* **Kraken:** USD for spot buys (if a coin's spot leg is there).
-* **Coinbase:** USD for spot buys, plus USD for futures margin. Coinbase moves USD from
-  spot into the futures (CFM) account automatically (around 5 pm ET) to cover margin;
-  moving it back is a "sweep" in the app. Keep **at least the full perp notional** as
-  cash on Coinbase: overnight margin on short alt perps is 30–95% of notional, and it
-  rises at the 5 pm ET switch from intraday to overnight rates.
-
-**First live run: one contract.** In `config.yaml`, **edit the existing lines** (don't
-paste a second `portfolio:` block; the config refuses duplicate sections):
-
-```yaml
-mode: live                       # was: paper
-portfolio:
-  ...
-  max_positions: 1               # was: 4
-  max_position_usd: 600          # was: 1000; pairs whose single contract is worth more are skipped
+```
+$ nano config.yaml
 ```
 
-(`fcap -c config.yaml markets --venue coinbase --kind perp` shows `$/contract`; it ranges
-from ~$55 for 1000SHIB to ~$1,000+ for BTC and XRP.)
+```yaml
+fees:
+  coinbase:
+    spot_taker: 0.0090      # ← from the coinbase line
+    spot_maker: 0.0050      # ←
+    …
+  kraken:
+    spot_taker: 0.0080      # ← from the kraken line
+    spot_maker: 0.0040      # ←
+```
 
-```bash
+Save (Ctrl + O, Enter) and exit (Ctrl + X). Then re-run `fcap -c config.yaml scan`,
+because your real fees change which pairs pass. Restart the paper engine so it uses
+them too.
+
+---
+
+## Phase 4: one live contract, then scale
+
+### 4a. Fund the accounts
+
+For the first trial the bot opens **one** pair of at most $600:
+
+* **Kraken:** deposit about **$800 USD** (Funding → Deposit → USD → bank/ACH). It buys
+  the spot coin with this.
+* **Coinbase:** keep about **$800 USD** in the **Default** portfolio. Futures margin is
+  drawn from that USD balance (Coinbase transfers it to the futures account itself; its
+  futures help pages describe the timing). Overnight margin on alt-coin shorts can reach
+  30–95% of their value, so keep the full amount there. Some pairs use Coinbase spot
+  instead of Kraken; this covers those too.
+
+### 4b. Switch the config to live, sized to one contract
+
+```
+$ nano config.yaml
+```
+
+**Change these existing lines** (don't add a second `portfolio:` section; the bot
+refuses duplicate sections):
+
+```yaml
+mode: live                      # was: paper
+portfolio:
+  capital_usd: 1600             # was: 5000 (what you actually deposited)
+  max_positions: 1              # was: 4
+  max_position_usd: 600         # was: 1000
+```
+
+### 4c. Start it
+
+```
 $ tmux new -s live
-$ source .venv/bin/activate
+$ cd ~/funding-capture && source .venv/bin/activate
 $ fcap -c config.yaml --log-file logs/live.log live --i-understand-this-trades-real-money
 ```
 
-Watch the first open and close **in both exchanges' UIs**:
+Detach (Ctrl + b, d). It opens a pair only when one passes your rules. That may take
+hours or days.
 
-* spot quantity bought == perp contracts × contract size (e.g. 1 DOGE contract = 5,000 DOGE)
-* the fees charged match `fees:` in your config
-* `fcap -c config.yaml status --live` agrees with the exchanges
-* funding shows up on Coinbase hourly. The bot's funding figure for Coinbase is an
-  *estimate* from published rates, because Coinbase has no funding-payment API. Compare
-  it with your Coinbase statements weekly.
+### 4d. Watch the first trade closely
 
-Then scale up gradually: `max_positions`, `max_position_usd`, `capital_usd`.
+When `fcap -c config.yaml status --live` shows an open pair:
 
-If the bot crashes or you stop it while a maker order is resting, that order stays on
-the exchange. Check open orders on Coinbase and Kraken whenever you restart.
-(`dead_man_seconds` in config makes Kraken cancel all open orders automatically if the
-bot stops. Only use it if the bot is the only thing trading that account.)
+1. **Kraken** (or Coinbase spot): the coin balance went up by the `qty` shown.
+2. **Coinbase → Futures → Positions:** a short in that coin of *contracts × contract
+   size* = the same `qty` (e.g. 1 DOGE contract = 5,000 DOGE).
+3. The fees charged on both orders match your `fees:` settings.
+4. Over the next hours, Coinbase shows hourly funding credits on the futures position.
+   The bot's `funding=` figure for Coinbase is an **estimate** (Coinbase has no API for
+   funding paid), so compare the two after a few days.
 
-## 10. Daily operations checklist
+Let it close the pair by itself (when funding fades), or test closing with
+`touch state/live/FLATTEN` (it closes everything; `rm state/live/FLATTEN` lets it trade
+again). After
+the close, both exchanges should be back to no position and only fees + funding should
+have changed your balances.
 
-* `fcap -c config.yaml status --live`: anything stuck, partially closed, or unexpectedly old?
-* `grep -iE "critical|error|risk close|halted|still open" logs/live.log`: investigate
-  every hit. `ENTRIES HALTED` in `status` means the bot found something it can't resolve
-  alone (usually a one-sided leftover after an order problem). Fix it on the exchange,
-  then restart the bot.
-* Coinbase margin: `fcap -c config.yaml check` prints the account's distance to
-  liquidation. The bot warns at 35% and closes pairs at 20%; add USD well before that.
-* Venue announcements: new/delisted perps, maintenance (Coinbase futures pause Fridays
-  5–6 pm ET), and contract roll-overs.
+If anything doesn't match, stop (see below) and paste `fcap -c config.yaml status --live`
+plus `tail -50 logs/live.log` to Claude.
+
+### 4e. Scale up slowly
+
+After a couple of clean round trips, raise `max_positions` (2, then 4) and
+`max_position_usd`, and keep `capital_usd` equal to what you actually deposited. Restart
+the live engine after each change.
+
+### Stopping, pausing, emergencies
+
+| You want to | Do this |
+|---|---|
+| pause new trades (keep managing open ones) | `touch state/live/STOP` (resume: `rm state/live/STOP`) |
+| close everything now | `touch state/live/FLATTEN` |
+| stop the program | `touch state/live/STOP`, wait 2 minutes, `tmux attach -t live`, **Ctrl + c**. Open pairs stay open and are managed again when you restart |
+| `status` says `ENTRIES HALTED` | the bot hit something it won't guess about (e.g. an order it couldn't confirm). Stop it, check open orders and positions on both exchanges, fix by hand, restart |
+
+### Daily routine once live
+
+```
+$ fcap -c config.yaml status --live
+$ fcap -c config.yaml check                        # Coinbase "margin buffer" line
+$ grep -iE "critical|error|halted|still open" logs/live.log | tail
+```
+
+* Margin buffer: the bot warns at 35% and closes pairs at 20%. Add USD to Coinbase well
+  before that.
 * Weekly: compare the bot's positions and funding with both exchanges' statements.
+
+---
+
+## Background: what you can trade from the US
+
+| Venue | What the bot uses it for | Status for a US person |
+|---|---|---|
+| **Coinbase** (Advanced) | spot long legs **and** the short perp leg: CFTC-regulated perpetual-style futures on ~20 coins (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX, LTC, DOT, XLM, HBAR, SUI, BCH, NEAR, AAVE, ONDO, ENA, ZEC, 1000SHIB, 1000PEPE), hourly funding | ✅ after futures onboarding |
+| **Kraken Pro** | spot long legs (many alts) | ✅ spot. Not available in NY or ME; no crypto withdrawals from IN |
+| Kraken US perps (Bitnomial) | – | exist, but no retail API |
+| Kalshi | – | lists a few perps since 2026, but no library support and invite-only API access |
+| Hyperliquid, Lighter | – | ❌ their terms of use exclude US persons |
+
+**Economics, honestly:**
+
+* **Spot fees are high.** Coinbase's entry tier is 0.50% maker / 0.90% taker; Kraken's is
+  about 0.40% / 0.80%. The bot rests limit (maker) orders on the spot leg, but a round
+  trip still costs ~1%. It therefore plans to hold positions about a month.
+* **Capital efficiency is poor.** You pay for the spot coins in full and Coinbase holds a
+  large margin on the short, so a $1,000 pair ties up about $2,000.
+* **Better tiers change everything.** Kraken lowers fees with assets held on the account
+  (~$20k → ~0.22% maker); Coinbase lowers them with volume or a USDC balance.
 
 ## Taxes (not advice)
 
-Spot sells are capital-gain events; Coinbase and Kraken issue 1099s. Coinbase's
+Spot sales are capital-gain events (Coinbase and Kraken send 1099s). Coinbase's US
 perpetual-style futures are regulated futures and may get Section 1256 (60/40)
-treatment, but a spot long hedged with a short future can be a "mixed straddle" with
-loss-deferral rules, and how funding payments are characterised is unsettled. Talk to a
-CPA before you scale up.
+treatment. A spot long hedged with a short future can be a "mixed straddle" with
+loss-deferral rules, and how funding is taxed is unsettled. Talk to a CPA before
+scaling up.
 
 ## Troubleshooting
 
-| Symptom | Likely cause / fix |
+| Symptom | Fix |
 |---|---|
-| `FAIL markets: NetworkError` | internet/VPN/firewall, or the venue is down; retry |
-| `FAIL credentials: COINBASE_SECRET_FILE: cannot read …` | the PEM path in `.env` is wrong |
-| `FAIL balance: AuthenticationError` | wrong key/secret, missing permission, or IP not allowlisted |
+| `command not found: fcap` | you're in a new window: `cd ~/funding-capture && source .venv/bin/activate` |
+| `FAIL markets: NetworkError` | internet, VPN or firewall, or the exchange is down: retry |
+| `FAIL credentials: COINBASE_SECRET_FILE: cannot read …` | re-run `fcap keys coinbase --json <file>` with a freshly created key |
+| `FAIL balance: AuthenticationError` | wrong key, missing permission, or your IP changed (update the allowlist) |
+| Kraken `EAPI:Invalid nonce` | the key was used by another program, or your clock is off: make a new key just for the bot |
+| Coinbase order `403` / "onboarded users" | finish futures onboarding (3a) |
+| `duplicate key 'portfolio'` | you pasted a second section into config.yaml: merge them into one |
+| `fees.kraken.spot_maker … fractions` | write `0.004`, not `0.4` or `0.4%` |
 | `found state/engine.json from an older version` | move it to `state/paper/` or `state/live/` as the message says |
-| Kraken `EAPI:Invalid nonce` | key used by another tool, or clock off: use a fresh key, sync your clock |
-| Coinbase order `403` / "onboarded users" | finish futures onboarding in the Coinbase app |
-| `coinbase rejected sor_limit_ioc …; retrying as FOK` | expected once if Coinbase doesn't accept IOC on futures; the bot switches automatically |
-| `scan` shows nothing with `*` | thresholds too strict for current funding, or fees too high: try `--all`, check `fees:` |
-| `ENTRIES HALTED: stale market data` | a venue stopped answering; clears when data returns |
-| `ENTRIES HALTED: unhedged residual or execution error …` | an order problem left a one-sided remainder, or the bot couldn't confirm an order was cancelled: check open orders and balances on both exchanges, fix by hand, then restart |
-| frequent `maker order … timed out` | spot leg not filling: raise `execution.maker_timeout_s`, or accept that coin is too thin |
+| `scan` never shows `*` | normal in quiet markets; check your `fees:` are right |
+| many `maker order … timed out` in the log | spot orders aren't filling: raise `execution.maker_timeout_s` a little, or that coin is too thin |
 
 ## Command reference
 
 ```
 fcap -c config.yaml check                       connectivity, market data, keys, your fees
+fcap keys coinbase --json FILE | fcap keys kraken    store API keys in .env
 fcap -c config.yaml markets --venue V [--kind perp|spot]   symbols and contract sizes
 fcap -c config.yaml scan [--top N] [--all]      live opportunities
-fcap -c config.yaml record [--interval S]       log funding forward (Coinbase has no history API)
+fcap -c config.yaml record                      log funding forward (Coinbase has no history API)
 fcap -c config.yaml import-funding --venue V --symbol S --file F [--percent]
-fcap -c config.yaml fetch [--days N] [--venues a,b]   download history (venues with a history
-                                                API; not needed for Coinbase perps)
-fcap -c config.yaml backtest [--start YYYY-MM-DD] [--end …] [--trades file.csv]
-fcap -c config.yaml sweep [--split 0.5] [--top N]
+fcap -c config.yaml backtest [--trades file.csv]
+fcap -c config.yaml sweep
 fcap -c config.yaml paper
 fcap -c config.yaml live --i-understand-this-trades-real-money
-fcap -c config.yaml status [--live] [--last N]
+fcap -c config.yaml status [--live]
 global options: -v (debug)  --log-file FILE  --env-file FILE (default .env)
 ```

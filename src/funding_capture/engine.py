@@ -108,6 +108,7 @@ class Engine:
         self._est_pending: dict[tuple[str, str], tuple[float, int]] = {}
         self._funding_checked_ms = 0
         self._seq = 0
+        self._started_ms: int | None = None  # first step ever (kept across restarts)
         self.state_path = Path(config.state_dir) / "engine.json"
 
     # ------------------------------------------------------------------ setup
@@ -163,6 +164,8 @@ class Engine:
 
     def step(self) -> StepReport:
         now = int(self.clock() * 1000)
+        if self._started_ms is None:
+            self._started_ms = now
         rep = StepReport()
         for v in self.venues.values():
             v.tick(now)
@@ -644,6 +647,8 @@ class Engine:
             "closed": [position_to_dict(p) for p in self.closed[-500:]],
             "forecaster": self.forecaster.to_dict(),
             "seq": self._seq,
+            "started_ms": self._started_ms,
+            "capital_usd": self.cfg.capital_usd,
             "venues": {n: v.to_dict() for n, v in self.venues.items() if hasattr(v, "to_dict")},
         }
         save_json(self.state_path, data)
@@ -656,6 +661,7 @@ class Engine:
         self.closed = [position_from_dict(d) for d in data.get("closed", [])]
         self.forecaster.load_dict(data.get("forecaster", {}))
         self._seq = data.get("seq", 0)
+        self._started_ms = data.get("started_ms")
         for n, vd in (data.get("venues") or {}).items():
             v = self.venues.get(n)
             if v is not None and hasattr(v, "load_dict"):

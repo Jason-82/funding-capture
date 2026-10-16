@@ -1,5 +1,5 @@
-"""Command line: fcap check | markets | scan | record | import-funding | fetch | backtest | sweep
-| paper | live | status."""
+"""Command line: fcap check | keys | markets | scan | record | import-funding | fetch | backtest
+| sweep | paper | live | status."""
 
 from __future__ import annotations
 
@@ -194,7 +194,21 @@ def cmd_status(args, settings: Settings) -> None:
             f"(funding ${p.funding_usd:,.2f}, fees ${p.entry_fees_usd + p.exit_fees_usd:,.2f}, "
             f"price ${p.realized_price_usd:,.2f})  {p.notes[-1] if p.notes else ''}"
         )
-    print(f"realised net P&L: ${sum(p.net_pnl_usd for p in closed):,.2f}")
+    realised = sum(p.net_pnl_usd for p in closed)
+    running = sum(p.funding_usd - p.borrow_usd - p.entry_fees_usd - p.exit_fees_usd for p in open_)
+    print(f"realised net P&L (closed pairs): ${realised:,.2f}")
+    print(f"open pairs so far (funding minus fees paid, before exit fees): ${running:,.2f}")
+    started = data.get("started_ms")
+    capital = data.get("capital_usd") or settings.portfolio.capital_usd
+    if started:
+        days = (datetime.now(UTC).timestamp() * 1000 - started) / 86_400_000
+        total = realised + running
+        print(f"running for {days:.1f} days on ${capital:,.0f} of capital")
+        if days >= 1:
+            print(
+                f"annualised return on capital so far: {total / capital * 365 / days:+.1%}"
+                "  (noisy until a few weeks have passed)"
+            )
 
 
 def cmd_scan(args, settings: Settings) -> None:
@@ -241,6 +255,64 @@ def cmd_fetch(args, settings: Settings) -> None:
             if i.kind.value == "perp" and i.key not in have and store.load_funding(i)
         )
     save_universe(store, venue_instruments, venue_perps)
+
+
+def _write_env(path: str, values: dict[str, str]) -> None:
+    """Set KEY=VALUE lines in a .env file (replacing old ones), readable only by you."""
+    import os
+    from pathlib import Path
+
+    p = Path(path)
+    keep = []
+    if p.exists():
+        keep = [
+            line
+            for line in p.read_text().splitlines()
+            if line.split("=", 1)[0].removeprefix("export ").strip() not in values
+        ]
+    keep += [f"{k}={v}" for k, v in values.items()]
+    p.write_text("\n".join(keep) + "\n")
+    os.chmod(p, 0o600)
+
+
+def cmd_keys(args, settings: Settings) -> None:
+    """Store API keys for a venue in .env (Coinbase: from the downloaded key file)."""
+    import getpass
+    import json
+    import os
+    from pathlib import Path
+
+    venue = args.venue.lower()
+    if venue == "coinbase":
+        if not args.json:
+            sys.exit(
+                "Coinbase: pass the downloaded key file, e.g. --json ~/Downloads/cdp_api_key.json"
+            )
+        data = json.loads(Path(args.json).expanduser().read_text())
+        name = data.get("name") or data.get("id")
+        secret = data.get("privateKey")
+        if not name or not secret:
+            sys.exit(f"{args.json} has no name/id and privateKey; is it the CDP API key file?")
+        values = {"COINBASE_API_KEY": name}
+        if "BEGIN" in secret:  # ECDSA: keep the multi-line PEM in its own file
+            folder = Path("~/.fcap").expanduser()
+            folder.mkdir(mode=0o700, exist_ok=True)
+            pem = folder / "coinbase.pem"
+            pem.write_text(secret if secret.endswith("\n") else secret + "\n")
+            os.chmod(pem, 0o600)
+            values["COINBASE_SECRET_FILE"] = str(pem)
+        else:  # Ed25519: a single base64 line
+            values["COINBASE_SECRET"] = secret
+    else:
+        prefix = venue.upper()
+        key = input(f"{venue} API key: ").strip()
+        secret = getpass.getpass(f"{venue} private key (input hidden): ").strip()
+        if not key or not secret:
+            sys.exit("nothing entered; .env unchanged")
+        values = {f"{prefix}_API_KEY": key, f"{prefix}_SECRET": secret}
+    _write_env(args.env_file, values)
+    print(f"saved {', '.join(values)} to {args.env_file} (permissions: owner only)")
+    print("next: fcap -c config.yaml check")
 
 
 def cmd_markets(args, settings: Settings) -> None:
@@ -444,6 +516,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--top", type=int, default=25)
     s.add_argument("--all", action="store_true", help="include rows failing liquidity filters")
     s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("keys", help="store a venue's API keys in .env")
+    s.add_argument("venue", help="coinbase or kraken (or another configured venue)")
+    s.add_argument("--json", help="Coinbase: path of the downloaded CDP key file")
+    s.set_defaults(fn=cmd_keys)
 
     s = sub.add_parser("markets", help="list a venue's markets and contract sizes")
     s.add_argument("--venue", required=True)
