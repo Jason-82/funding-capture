@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -39,10 +40,17 @@ def save_json(path: str | Path, data: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, default=str))
-    os.replace(tmp, path)
+    tmp.write_text(json.dumps(data, indent=1, default=str), encoding="utf-8")
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: another program is reading the file right now
+            if attempt == 9:
+                raise
+            time.sleep(0.2)
 
 
 def load_json(path: str | Path) -> dict | None:
     path = Path(path)
-    return json.loads(path.read_text()) if path.exists() else None
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None

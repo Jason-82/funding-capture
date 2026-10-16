@@ -47,13 +47,15 @@ class HistoryStore:
     def save_instruments(self, venue: str, instruments: list[Instrument]) -> None:
         path = self.root / venue / "instruments.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps([instrument_to_dict(i) for i in instruments], indent=1))
+        path.write_text(
+            json.dumps([instrument_to_dict(i) for i in instruments], indent=1), encoding="utf-8"
+        )
 
     def load_instruments(self, venue: str) -> list[Instrument]:
         path = self.root / venue / "instruments.json"
         if not path.exists():
             return []
-        return [instrument_from_dict(d) for d in json.loads(path.read_text())]
+        return [instrument_from_dict(d) for d in json.loads(path.read_text(encoding="utf-8"))]
 
     def venues(self) -> list[str]:
         if not self.root.exists():
@@ -68,7 +70,7 @@ class HistoryStore:
         path = self._funding_path(inst)
         if not path.exists():
             return []
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             return [(int(r["ts_ms"]), float(r["rate"])) for r in csv.DictReader(f)]
 
     def append_funding(self, inst: Instrument, rows: list[tuple[int, float]]) -> int:
@@ -79,7 +81,7 @@ class HistoryStore:
             existing[int(ts)] = float(rate)
         path = self._funding_path(inst)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", newline="") as f:
+        with path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["ts_ms", "rate"])
             for ts in sorted(existing):

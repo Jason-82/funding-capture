@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import sys
 from datetime import UTC, datetime, timedelta
@@ -22,7 +23,7 @@ def load_env_file(path: str) -> int:
     if not p.exists():
         return 0
     n = 0
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8-sig").splitlines():  # -sig: Notepad BOM
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -267,17 +268,31 @@ def _write_env(path: str, values: dict[str, str]) -> None:
     if p.exists():
         keep = [
             line
-            for line in p.read_text().splitlines()
+            for line in p.read_text(encoding="utf-8-sig").splitlines()
             if line.split("=", 1)[0].removeprefix("export ").strip() not in values
         ]
     keep += [f"{k}={v}" for k, v in values.items()]
-    p.write_text("\n".join(keep) + "\n")
+    p.write_text("\n".join(keep) + "\n", encoding="utf-8", newline="\n")
     os.chmod(p, 0o600)
+
+
+def _ask(prompt: str, hidden: bool = False) -> str:
+    """Prompt for a value. Hidden input uses getpass in a real console; Git Bash (mintty)
+    has none and getpass can hang there, so it falls back to a visible line read."""
+    import getpass
+    import os
+
+    git_bash = bool(os.environ.get("MSYSTEM")) or not sys.stdin.isatty()
+    if hidden and not git_bash:
+        return getpass.getpass(prompt + "(input hidden) ").strip()
+    if hidden:
+        prompt += "(paste, then Enter; it will be visible, so run `clear` afterwards) "
+    print(prompt, end="", flush=True)
+    return sys.stdin.readline().strip()
 
 
 def cmd_keys(args, settings: Settings) -> None:
     """Store API keys for a venue in .env (Coinbase: from the downloaded key file)."""
-    import getpass
     import json
     import os
     from pathlib import Path
@@ -288,25 +303,26 @@ def cmd_keys(args, settings: Settings) -> None:
             sys.exit(
                 "Coinbase: pass the downloaded key file, e.g. --json ~/Downloads/cdp_api_key.json"
             )
-        data = json.loads(Path(args.json).expanduser().read_text())
+        data = json.loads(Path(args.json).expanduser().read_text(encoding="utf-8-sig"))
         name = data.get("name") or data.get("id")
         secret = data.get("privateKey")
         if not name or not secret:
             sys.exit(f"{args.json} has no name/id and privateKey; is it the CDP API key file?")
         values = {"COINBASE_API_KEY": name}
         if "BEGIN" in secret:  # ECDSA: keep the multi-line PEM in its own file
-            folder = Path("~/.fcap").expanduser()
+            folder = Path(os.environ.get("FCAP_KEY_DIR", "~/.fcap")).expanduser()
             folder.mkdir(mode=0o700, exist_ok=True)
             pem = folder / "coinbase.pem"
-            pem.write_text(secret if secret.endswith("\n") else secret + "\n")
+            body = secret if secret.endswith("\n") else secret + "\n"
+            pem.write_text(body, encoding="ascii", newline="\n")
             os.chmod(pem, 0o600)
             values["COINBASE_SECRET_FILE"] = str(pem)
         else:  # Ed25519: a single base64 line
             values["COINBASE_SECRET"] = secret
     else:
         prefix = venue.upper()
-        key = input(f"{venue} API key: ").strip()
-        secret = getpass.getpass(f"{venue} private key (input hidden): ").strip()
+        key = _ask(f"{venue} API key: ")
+        secret = _ask(f"{venue} private key: ", hidden=True)
         if not key or not secret:
             sys.exit("nothing entered; .env unchanged")
         values = {f"{prefix}_API_KEY": key, f"{prefix}_SECRET": secret}
@@ -577,9 +593,14 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_live)
 
     args = p.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # Git Bash hands Windows Python a pipe, which it block-buffers and encodes as
+        # cp1252: output would arrive in bursts and non-ASCII text would raise.
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file))
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

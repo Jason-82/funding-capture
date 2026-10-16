@@ -52,7 +52,7 @@ def credentials_from_env(venue: str) -> dict[str, str]:
         if not value and os.environ.get(f"{name}_FILE"):
             path = os.path.expanduser(os.environ[f"{name}_FILE"])
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     value = f.read().strip()
             except OSError as exc:
                 raise ValueError(f"{name}_FILE: cannot read {path}: {exc.strerror}") from None

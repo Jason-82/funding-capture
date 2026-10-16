@@ -135,11 +135,12 @@ def test_us_config_loads():
 
 
 def test_keys_command_coinbase_json_and_kraken_prompt(tmp_path, monkeypatch):
+    import io
     import json
     import os
     import stat
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FCAP_KEY_DIR", str(tmp_path / "keys"))
     env = tmp_path / ".env"
     env.write_text("OTHER=1\nCOINBASE_API_KEY=old\n")
     key = tmp_path / "cdp_api_key.json"
@@ -149,13 +150,16 @@ def test_keys_command_coinbase_json_and_kraken_prompt(tmp_path, monkeypatch):
     text = env.read_text()
     assert "OTHER=1" in text and "COINBASE_API_KEY=organizations/o/apiKeys/k" in text
     assert "COINBASE_API_KEY=old" not in text
-    saved = tmp_path / ".fcap" / "coinbase.pem"
-    assert saved.read_text() == pem and f"COINBASE_SECRET_FILE={saved}" in text
-    assert stat.S_IMODE(os.stat(env).st_mode) == 0o600
-    assert stat.S_IMODE(os.stat(saved).st_mode) == 0o600
+    saved = tmp_path / "keys" / "coinbase.pem"
+    assert saved.read_bytes() == pem.encode()  # LF line endings even on Windows
+    assert f"COINBASE_SECRET_FILE={saved}" in text
+    if os.name != "nt":  # Windows has no owner-only mode bits
+        assert stat.S_IMODE(os.stat(env).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(saved).st_mode) == 0o600
 
-    monkeypatch.setattr("builtins.input", lambda prompt: "KRAKENKEY")
-    monkeypatch.setattr("getpass.getpass", lambda prompt: "c2VjcmV0==")
+    # Git Bash: no console for getpass, so values are read as plain lines from stdin
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    monkeypatch.setattr("sys.stdin", io.StringIO("KRAKENKEY\nc2VjcmV0==\n"))
     main(["--env-file", str(env), "keys", "kraken"])
     text = env.read_text()
     assert "KRAKEN_API_KEY=KRAKENKEY" in text and "KRAKEN_SECRET=c2VjcmV0==" in text
@@ -171,6 +175,21 @@ def test_keys_command_coinbase_json_and_kraken_prompt(tmp_path, monkeypatch):
         "secret": pem.strip(),
     }
     assert credentials_from_env("kraken")["secret"] == "c2VjcmV0=="
+
+
+def test_notepad_bom_and_crlf_are_tolerated(tmp_path, monkeypatch):
+    from funding_capture.cli import load_env_file
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_bytes("\ufeffportfolio:\r\n  capital_usd: 1600  # ← edited in Notepad\r\n".encode())
+    assert load_settings(cfg).portfolio.capital_usd == 1600
+    env = tmp_path / ".env"
+    env.write_bytes("\ufeffKRAKEN_API_KEY=abc\r\n".encode())
+    monkeypatch.delenv("KRAKEN_API_KEY", raising=False)
+    assert load_env_file(str(env)) == 1
+    import os
+
+    assert os.environ["KRAKEN_API_KEY"] == "abc"
 
 
 def test_status_shows_annualised_return(tmp_path, capsys):

@@ -83,7 +83,8 @@ def _check_fees(name: str, fees: VenueFees) -> None:
 
 
 def load_settings(path: str | Path | None) -> Settings:
-    raw = yaml.load(Path(path).read_text(), Loader=_UniqueKeyLoader) if path else {}
+    text = Path(path).read_text(encoding="utf-8-sig") if path else ""  # -sig: Notepad BOM
+    raw = yaml.load(text, Loader=_UniqueKeyLoader) if path else {}
     raw = raw or {}
     known = {f.name for f in dataclasses.fields(Settings)} | {"fees"}
     unknown = set(raw) - known
