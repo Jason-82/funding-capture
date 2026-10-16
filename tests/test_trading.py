@@ -172,8 +172,12 @@ def test_maker_fill_below_one_contract_is_topped_up_not_sold_back():
 
     va.fetch_order_state = part_filled
     va.cancel_order = lambda inst, oid: OrderState(oid, 4.0, 99.9, 0.4, False)
+    reads, real_touch = [], vb.fetch_touch
+    vb.fetch_touch = lambda inst: reads.append(1) or real_touch(inst)
     rep = ex.open(cand, 1_010)
     assert rep.hedged_qty == pytest.approx(10)  # 4 resting + 6 taken, one contract hedged
+    assert len(reads) < 6  # no hedge-leg book reads on every poll while nothing new fills
+    assert not any(m.startswith(("stopped:", "maker order")) for m in rep.messages)
     assert va.fetch_spot_balance(cand.long) == pytest.approx(10)
     assert vb.fetch_perp_positions()[cand.short.key].qty == pytest.approx(-10)
     assert not [f for f in rep.fills if f.instrument == cand.long and f.order_side == "sell"]

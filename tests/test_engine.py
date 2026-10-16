@@ -790,3 +790,25 @@ def test_close_failure_count_survives_a_short_gap_in_risk_alerts(tmp_path, clock
     w.touch_quotes()
     w.engine.step()  # this step's alert skipped (e.g. a failed read): keep the count
     assert w.engine._close_fails[pos.id] == 2
+
+
+def test_dust_below_one_order_counts_as_flat(tmp_path, clock, monkeypatch, caplog):
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    w.engine.executor.trade_one(c.short, "buy", pos.qty, True)  # the short is gone
+    w.engine.executor.trade_one(c.long, "sell", pos.qty - 0.01, False)  # 0.01 spot left
+    spot_venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    monkeypatch.setattr(spot_venue, "min_qty", lambda inst: 0.5)  # Kraken won't sell 0.01
+    real_ioc = spot_venue.place_ioc
+
+    def kraken_ioc(inst, side, qty, limit, reduce_only=False):
+        if not inst.is_perp and qty < 0.5:
+            raise RuntimeError('kraken {"error":["EOrder:Order minimum not met"]}')
+        return real_ioc(inst, side, qty, limit, reduce_only)
+
+    monkeypatch.setattr(spot_venue, "place_ioc", kraken_ioc)
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert pos.id not in w.engine.positions and "could not flatten" not in caplog.text

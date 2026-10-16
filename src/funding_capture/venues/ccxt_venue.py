@@ -469,6 +469,38 @@ class CcxtVenue(Venue):
             st = self.fetch_order_state(inst, order_id)
         return st
 
+    def _confirm_ioc(self, inst: Instrument, oid: str, tries: int = 6) -> dict:
+        """The final state of an IOC whose create reply didn't say what filled (Kraken's
+        AddOrder returns only an id). Never assume "nothing filled": that would send the
+        same order again and leave the first fill unhedged and unrecorded. Reads until the
+        order is final, cancels it if it still looks open, and raises if that can't be
+        confirmed (the executor then treats the trade as unsafe and halts entries)."""
+        import ccxt
+
+        def read() -> dict | None:
+            last = None
+            for i in range(tries):
+                if i:
+                    time.sleep(0.5)
+                try:
+                    last = self.ex.fetch_order(oid, inst.symbol)
+                except Exception as exc:
+                    log.warning("%s: fetch_order %s failed: %s", self.name, oid, exc)
+                    continue
+                if last.get("status") not in (None, "open"):
+                    return last
+            return last
+
+        order = read()
+        if order is not None and order.get("status") not in (None, "open"):
+            return order
+        with contextlib.suppress(ccxt.OrderNotFound, ccxt.BadRequest, ccxt.InvalidOrder):
+            self.ex.cancel_order(oid, inst.symbol)  # an IOC still "open" is pending: end it
+        order = read()
+        if order is None or order.get("status") in (None, "open"):
+            raise RuntimeError(f"{self.name}: IOC {oid} fill could not be confirmed")
+        return order
+
     def _require_trading(self) -> None:
         if not self.can_trade:
             raise RuntimeError(f"{self.name}: ccxt cannot confirm fills here; trading disabled")
@@ -498,10 +530,7 @@ class CcxtVenue(Venue):
                 return Fill(inst, order_side, 0.0, limit_price, 0.0, None)
             raise
         if order.get("filled") is None or order.get("status") in (None, "open"):
-            try:
-                order = self.ex.fetch_order(order["id"], inst.symbol)
-            except Exception as exc:  # fall back to what create_order returned
-                log.warning("%s: fetch_order %s failed: %s", self.name, order.get("id"), exc)
+            order = self._confirm_ioc(inst, str(order["id"]))
         filled = float(order.get("filled") or 0.0)
         avg = float(order.get("average") or order.get("price") or price)
         qty_filled = filled * unit

@@ -372,10 +372,13 @@ class PairExecutor:
                 if seen.qty > 0:
                     started = self.clock()
             if not failed and carry.qty > 1e-12:
-                remaining -= self._top_up(m, h, carry, rep, remaining)
+                got = self._top_up(m, h, carry, rep, remaining)
+                remaining -= got
                 if self._sendable(h, carry.qty, ref_mid) > 0:
                     reason = "hedge failed"  # the hedge venue refused the whole lot
-            if timed_out:
+                elif got and remaining * ref_mid <= self.p.residual_tolerance_usd:
+                    rep.messages = [x for x in rep.messages if not x.startswith("stopped:")]
+            if timed_out and self._round_both(m, h, remaining) > 0:  # a lot really left
                 rep.messages.append(
                     f"maker order on {m.inst.key} timed out; {remaining:.6g} not traded"
                 )
@@ -408,7 +411,7 @@ class PairExecutor:
             )
             seen.qty, seen.cost, seen.fee = st.filled, cost_now, st.fee_usd
             carry.qty += new
-        if not hedge or carry.qty <= 1e-12:
+        if not hedge or carry.qty <= 1e-12 or new <= 1e-12:  # carry changes only with fills
             return True
         want = carry.qty
         left = self._hedge(h, want, rep)

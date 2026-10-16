@@ -359,3 +359,41 @@ def test_per_contract_minimum_fee():
     # one contract = 10M SHIB; at $0.00000553 that is $55.30, so $0.20 is 36 bps
     assert costs.leg_cost(shib, price=0.00553 / 1000) == pytest.approx(0.20 / 55.3)
     assert costs.leg_cost(shib) == pytest.approx(0.0002)  # no price: percentage only
+
+
+def test_kraken_ioc_fill_is_confirmed_never_assumed_zero(monkeypatch):
+    import funding_capture.venues.ccxt_venue as cv
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    v.ex.create_order = lambda *a, **k: {"id": "O1", "status": None, "filled": None}
+    reads = []
+
+    def flaky(oid, symbol):  # one timeout, then the real answer
+        reads.append(oid)
+        if len(reads) == 1:
+            raise ccxt.RequestTimeout("kraken timed out")
+        return {"id": oid, "status": "closed", "filled": 0.07, "average": 60_000}
+
+    v.ex.fetch_order = flaky
+    assert v.place_ioc(btc, "buy", 0.1, 60_000).qty == pytest.approx(0.07)
+
+    states = iter(["open", "open", "open", "open", "open", "open", "canceled"])
+    cancels = []
+    v.ex.fetch_order = lambda oid, symbol: {
+        "id": oid,
+        "status": next(states),
+        "filled": 0.05,
+        "average": 60_000,
+    }
+    v.ex.cancel_order = lambda oid, symbol: cancels.append(oid)
+    assert v.place_ioc(btc, "buy", 0.1, 60_000).qty == pytest.approx(0.05)  # pending: ended
+    assert cancels == ["O1"]
+
+    def down(oid, symbol):
+        raise ccxt.ExchangeNotAvailable("EService:Unavailable")
+
+    v.ex.fetch_order = down
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        v.place_ioc(btc, "buy", 0.1, 60_000)

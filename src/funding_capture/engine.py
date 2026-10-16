@@ -729,6 +729,10 @@ class Engine:
                     helds.append(sign * (p.qty if p else 0.0))
                 else:
                     helds.append(min(sign * self._leg_view(inst).qty, pos.qty))
+            for i, (inst, _) in enumerate(legs):  # dust no order can trade counts as flat
+                v = self.venues[inst.venue]
+                if helds[i] > 0 and v.round_qty(inst, helds[i]) < max(v.min_qty(inst), 1e-12):
+                    helds[i] = 0.0
             for (inst, _), held in zip(legs, helds, strict=True):
                 if held > 0:  # every leg we will trade needs a book (a halted one raises)
                     self.venues[inst.venue].fetch_touch(inst)
