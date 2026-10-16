@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .costs import CostModel
 from .data import HistoryStore, interval_for
-from .execution import PairExecutor
+from .execution import PairExecutor, PreTradeError
 from .forecast import StreamingForecaster
 from .models import (
     MS_PER_HOUR,
@@ -44,6 +44,7 @@ from .venues.base import Venue
 # Halts that lift by themselves once their cause is gone. Any other reason (an unconfirmed
 # order, an unhedged residual) means the real exposure is unknown: it holds until a restart.
 _SOFT_HALTS = ("STOP file present", "FLATTEN file present", "stale market data")
+_CLOSE_RETRY_MS = 10 * 60_000  # wait after a failed close: a retry may pay the same fees
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +117,10 @@ class Engine:
         self._seq = 0
         self._started_ms: int | None = None  # first step ever (kept across restarts)
         self._save_failed = False  # state file not writable: no new pairs until it is
+        self._positions_fresh: set[str] = set()  # venues whose perp positions this step read
+        self._touched: set[str] = set()  # pairs traded this step: cached positions are stale
+        self._close_blocked_until: dict[str, int] = {}  # pair id -> ms, after a failed close
+        self._untracked_seen: set[str] = set()
         self.state_path = Path(config.state_dir) / "engine.json"
 
     # ------------------------------------------------------------------ setup
@@ -157,13 +162,16 @@ class Engine:
 
     # ------------------------------------------------------------------ main loop
     def run(self, max_steps: int | None = None) -> None:
-        with lock_state_dir(self.cfg.state_dir):  # StateLocked if another engine runs here
+        # StateLocked if another engine runs here (retries cover a `status` probe)
+        with lock_state_dir(self.cfg.state_dir, retries=10):
             quit_file = Path(self.cfg.state_dir) / "QUIT"
             if quit_file.exists():  # from a stop the last engine never saw: not for us
                 quit_file.unlink(missing_ok=True)
                 log.warning("removed a QUIT file left over from an earlier stop")
-            self.bootstrap()
+            if not self._bootstrap_with_retry():
+                return
             n = 0
+            quit_pending = False
             while max_steps is None or n < max_steps:
                 started = self.clock()
                 try:
@@ -171,20 +179,54 @@ class Engine:
                     self._log_step(rep)
                 except Exception:
                     log.exception("step failed; continuing")
+                    self._save()  # it may have traded before it failed
                 n += 1
                 if max_steps is not None and n >= max_steps:
                     return
-                if self._wait_or_quit(max(0.0, self.cfg.loop_seconds - (self.clock() - started))):
-                    if self._save_failed:
-                        self._save()
-                    if not self._save_failed:
-                        return
-                    log.critical(
-                        "QUIT ignored: %s could not be written, and exiting now would lose "
-                        "track of positions. Close the program holding it, then touch QUIT "
-                        "again",
-                        self.state_path,
-                    )
+                wait = max(0.0, self.cfg.loop_seconds - (self.clock() - started))
+                asked = self._wait_or_quit(wait)
+                quit_pending = quit_pending or asked
+                if quit_pending and self._ready_to_quit(asked):
+                    log.warning("QUIT file found: exiting; open pairs stay open until restart")
+                    return
+
+    def _ready_to_quit(self, just_asked: bool) -> bool:
+        """A QUIT waits while FLATTEN is still closing pairs, and until the state is saved
+        (exiting earlier would leave positions the next start doesn't know about)."""
+        if (Path(self.cfg.state_dir) / "FLATTEN").exists() and self.positions:
+            if just_asked:
+                log.warning(
+                    "QUIT waits: FLATTEN is still closing %d pair(s); `rm` FLATTEN to exit now",
+                    len(self.positions),
+                )
+            return False
+        self._save()
+        if self._save_failed:
+            if just_asked:
+                log.critical(
+                    "QUIT waits: %s cannot be written; the bot exits by itself as soon as it "
+                    "can. Close the program holding it",
+                    self.state_path,
+                )
+            return False
+        return True
+
+    def _bootstrap_with_retry(self) -> bool:
+        """Start even if an exchange is down right now (False: QUIT while waiting)."""
+        delay = 15.0
+        for attempt in range(30):  # about half an hour
+            try:
+                self.bootstrap()
+                return True
+            except Exception as exc:
+                if attempt == 29:
+                    raise
+                log.warning("startup failed (%s); retrying in %.0f s", exc, delay)
+                if self._wait_or_quit(delay):
+                    log.warning("QUIT file found during startup: exiting")
+                    return False
+                delay = min(delay * 2, 60.0)
+        return False
 
     def _wait_or_quit(self, seconds: float) -> bool:
         """Sleep between steps; True if a QUIT file asks for a clean exit (it is removed,
@@ -194,7 +236,6 @@ class Engine:
         while True:
             if quit_file.exists():
                 quit_file.unlink(missing_ok=True)
-                log.warning("QUIT file found: exiting; open pairs stay open until restart")
                 return True
             left = deadline - time.monotonic()
             if left <= 0:
@@ -206,6 +247,7 @@ class Engine:
         if self._started_ms is None:
             self._started_ms = now
         rep = StepReport()
+        self._touched = set()
         for v in self.venues.values():
             v.tick(now)
             v.heartbeat()
@@ -229,12 +271,18 @@ class Engine:
         return [i for i in self.instruments.values() if i.venue == venue]
 
     def refresh(self, now: int, with_positions: bool = True) -> None:
-        held = {v for p in self.positions.values() for v in p.candidate.venues}
+        # every venue we trade perps on, so a position no pair accounts for is noticed
+        perp_venues = {i.venue for i in self.instruments.values() if i.is_perp}
+        perp_venues |= {
+            i.venue for p in self.positions.values() for i in (p.candidate.long, p.candidate.short)
+        }
+        self._positions_fresh = set()
 
         def pull(name: str):
             v = self.venues[name]
             insts = self._instruments_on(name)
-            perp_pos = v.fetch_perp_positions() if with_positions and name in held else {}
+            want = with_positions and name in perp_venues
+            perp_pos = v.fetch_perp_positions() if want else None
             return name, v.fetch_funding(insts), v.fetch_quotes(insts), perp_pos
 
         with ThreadPoolExecutor(max_workers=max(1, len(self.venues))) as pool:
@@ -247,9 +295,11 @@ class Engine:
                     continue
                 self.snaps.update(snaps)
                 self.quotes.update(quotes)
-                for k in [k for k in self._perp_positions if k.startswith(name + ":")]:
-                    del self._perp_positions[k]
-                self._perp_positions.update(perp_pos)
+                if perp_pos is not None:
+                    for k in [k for k in self._perp_positions if k.startswith(name + ":")]:
+                        del self._perp_positions[k]
+                    self._perp_positions.update(perp_pos)
+                    self._positions_fresh.add(name)
                 self.data_ms[name] = now
                 for key, snap in snaps.items():  # only fresh observations feed the forecast
                     self.forecaster.observe(key, snap.hourly, now)
@@ -349,15 +399,50 @@ class Engine:
         stale = [v for v in self.venues if self._stale(v, now)]
         if stale:
             alerts.append(RiskAlert(Action.HALT, "data", f"stale data from {', '.join(stale)}"))
+        unknown: set[str] = set()
         for pos in self.positions.values():
             c = pos.candidate
             if c.long.venue in stale or c.short.venue in stale:
                 continue  # cannot judge it; the HALT alert already covers this
-            alerts.extend(
-                check_position(pos, self._leg_view(c.long), self._leg_view(c.short), self.limits)
+            if pos.id in self._touched:
+                continue  # traded earlier in this step: the positions read are out of date
+            blind = {i.venue for i in (c.long, c.short) if i.is_perp} - self._positions_fresh
+            if blind:  # a missing reading must never count as "no position"
+                unknown |= blind
+                continue
+            try:
+                lv, sv = self._leg_view(c.long), self._leg_view(c.short)
+            except Exception as exc:  # e.g. a private API down while public data works
+                log.error("%s: cannot read holdings: %s", pos.id, exc)
+                alerts.append(RiskAlert(Action.HALT, "data", f"holdings unavailable: {exc}"))
+                continue
+            alerts.extend(check_position(pos, lv, sv, self.limits))
+        if unknown:
+            alerts.append(
+                RiskAlert(Action.HALT, "data", f"positions unknown on {', '.join(sorted(unknown))}")
             )
+        self._check_untracked()
         alerts.extend(self._account_margin_alerts(stale, now))
         return alerts
+
+    def _check_untracked(self) -> None:
+        """A perp position that no pair accounts for is naked exposure (a leg left behind
+        by a crash, or a trade by hand): halt entries until a person looks at it."""
+        tracked = {
+            i.key for p in self.positions.values() for i in (p.candidate.long, p.candidate.short)
+        }
+        for key, p in self._perp_positions.items():
+            inst = self.instruments.get(key)
+            if inst is None or inst.venue not in self._positions_fresh or key in tracked:
+                continue
+            if abs(p.qty) < self.venues[inst.venue].min_qty(inst):
+                continue  # dust below one order
+            why = f"untracked position on {key}: {p.qty:+.6g}"
+            if self.entries_halted is None or self.entries_halted in _SOFT_HALTS:
+                self.entries_halted = why
+            if key not in self._untracked_seen:
+                self._untracked_seen.add(key)
+                log.critical("%s; no pair in engine.json uses it. Close it by hand", why)
 
     def _account_margin_alerts(self, stale: list[str], now: int) -> list[RiskAlert]:
         """Venues that report margin per account (Coinbase US futures) rather than a
@@ -460,12 +545,24 @@ class Engine:
         self, pos: PairPosition, reason: str, rep: StepReport, now: int, urgent: bool = False
     ) -> None:
         c = pos.candidate
+        if self._close_blocked_until.get(pos.id, 0) > now:
+            return
+        down = [v for v in c.venues if self._stale(v, now)]
+        if down:
+            log.warning("cannot close %s now (%s): no fresh data from %s", pos.id, reason, down)
+            return
+        qty = self._closable_qty(pos)
+        self._touched.add(pos.id)
         try:
-            ex = self.executor.close(c, pos.qty, urgent=urgent)
+            ex = self.executor.close(c, qty, urgent=urgent)
+        except PreTradeError as exc:  # nothing was sent
+            log.warning("close %s skipped this step: %s", pos.id, exc)
+            return
         except Exception as exc:  # the executor reports errors; this is a last resort
             self.entries_halted = f"close of {pos.id} raised: {exc}"
             log.critical("close %s raised; exposure unknown, entries halted: %s", pos.id, exc)
             pos.notes.append(f"close failed: {exc}")
+            self._close_failed(pos, now)
             return
         sold = ex.qty(c.long, "sell")
         bought = ex.qty(c.short, "buy")
@@ -483,7 +580,7 @@ class Engine:
         if ex.has_residual or ex.unsafe:
             self.entries_halted = f"unhedged residual or execution error closing {pos.id}"
             log.critical("%s: residual %s, messages %s", pos.id, ex.residual, ex.messages)
-        if done >= pos.qty * 0.999:
+        if done >= qty * 0.999:
             self._collect_funding(pos)
             pos.closed_ms = now
             pos.notes.append(f"closed: {reason}")
@@ -496,14 +593,50 @@ class Engine:
         else:
             pos.qty -= done
             pos.notes.append(f"partial close {done:.6g}: {reason}")
+            self._close_failed(pos, now)
+
+    def _close_failed(self, pos: PairPosition, now: int) -> None:
+        self._close_blocked_until[pos.id] = now + _CLOSE_RETRY_MS
+        log.critical(
+            "%s did not close; next try in %d min. If this repeats, `rm` FLATTEN if present, "
+            "stop the bot with QUIT and close both legs by hand",
+            pos.id,
+            _CLOSE_RETRY_MS // 60_000,
+        )
+
+    def _closable_qty(self, pos: PairPosition) -> float:
+        """pos.qty, capped at what the accounts still hold (a stop in the middle of a close
+        can leave both legs smaller than the record; selling more than is held fails)."""
+        qty = pos.qty
+        for inst in (pos.candidate.long, pos.candidate.short):
+            try:
+                if inst.is_perp:
+                    p = self.venues[inst.venue].fetch_perp_positions().get(inst.key)
+                    held = abs(p.qty) if p else 0.0
+                else:
+                    held = self.venues[inst.venue].fetch_spot_balance(inst)
+            except Exception as exc:
+                log.warning(
+                    "%s: holdings of %s unavailable (%s); using the record", pos.id, inst.key, exc
+                )
+                continue
+            if 0 < held < qty:
+                qty = held
+        if qty < pos.qty * 0.999:
+            log.warning("%s: closing %.6g held, not the %.6g recorded", pos.id, qty, pos.qty)
+        return qty
 
     def _flatten(self, pos: PairPosition, reason: str, rep: StepReport, now: int) -> None:
         """Close each leg on its own, for what is actually held (used when legs mismatch)."""
         c = pos.candidate
         flat = True
+        self._touched.add(pos.id)
         for inst, sign in ((c.long, 1), (c.short, -1)):
-            view = self._leg_view(inst)
-            held = sign * view.qty if inst.is_perp else min(sign * view.qty, pos.qty)
+            if inst.is_perp:  # read now, not from the start of the step
+                p = self.venues[inst.venue].fetch_perp_positions().get(inst.key)
+                held = sign * (p.qty if p else 0.0)
+            else:
+                held = min(sign * self._leg_view(inst).qty, pos.qty)
             if held <= 0:
                 continue
             side = "sell" if sign > 0 else "buy"
@@ -547,10 +680,17 @@ class Engine:
     def _rebalance(self, pos: PairPosition) -> None:
         """Trim the larger leg down to the smaller one (reduces exposure, never adds)."""
         c = pos.candidate
+        self._touched.add(pos.id)
         lv, sv = self._leg_view(c.long), self._leg_view(c.short)
         held_long = lv.qty if c.long.is_perp else min(lv.qty, pos.qty)
         held_short = -sv.qty if c.short.is_perp else min(-sv.qty, pos.qty)
         diff = held_long - held_short
+        inst = c.long if diff > 0 else c.short
+        if self.venues[inst.venue].round_qty(inst, abs(diff)) <= 0:
+            # legs match but are smaller than recorded (e.g. stopped mid-close): resize
+            pos.qty = min(held_long, held_short)
+            pos.notes.append(f"resized to holdings: {pos.qty:.6g}")
+            return
         try:
             if diff > 0:
                 f = self.executor.trade_one(c.long, "sell", diff, c.long.is_perp)
@@ -644,6 +784,9 @@ class Engine:
         c = s.candidate
         try:
             ex = self.executor.open(c, notional)
+        except PreTradeError as exc:  # nothing was sent
+            log.warning("open %s skipped: %s", c.key, exc)
+            return None
         except Exception as exc:  # the executor reports errors; this is a last resort
             self.entries_halted = f"open of {c.key} raised: {exc}"
             log.critical("open %s raised; exposure unknown, entries halted: %s", c.key, exc)

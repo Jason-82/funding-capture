@@ -165,6 +165,30 @@ def cmd_check(args, settings: Settings) -> None:
         sys.exit(f"{failures} check(s) failed")
 
 
+def _liveness(path, live: bool, settings: Settings) -> str:
+    """Whether the engine runs, from its lock (an engine holds it while it runs; the OS
+    drops it when the process ends), and how long ago it last saved."""
+    from .state import StateLocked, lock_state_dir
+
+    which = "live" if live else "paper"
+    age_min = (datetime.now(UTC).timestamp() - path.stat().st_mtime) / 60
+    try:
+        with lock_state_dir(path.parent):
+            running = False
+    except StateLocked:
+        running = True
+    if not running:
+        return f"WARNING: the {which} engine is NOT running (last saved {age_min:.0f} min ago)"
+    line = f"engine: running, last saved {age_min:.0f} min ago"
+    if age_min > max(10.0, 3 * settings.portfolio.loop_seconds / 60):
+        line += (
+            "\nNOTE: it is running but has not saved for a while: busy with an order, or "
+            "unable to write engine.json (look for CRITICAL in its window). Leave the "
+            "exchanges alone."
+        )
+    return line
+
+
 def cmd_status(args, settings: Settings) -> None:
     """Print positions and P&L from the engine's state file (works while it runs)."""
     from pathlib import Path
@@ -178,15 +202,7 @@ def cmd_status(args, settings: Settings) -> None:
     open_ = [position_from_dict(d) for d in data.get("positions", [])]
     closed = [position_from_dict(d) for d in data.get("closed", [])]
     print(f"state: {path}")
-    # the engine saves after every step, so an old file means it is not running
-    age_min = (datetime.now(UTC).timestamp() - path.stat().st_mtime) / 60
-    print(f"last update: {age_min:.0f} min ago")
-    if age_min > max(10.0, 3 * settings.portfolio.loop_seconds / 60):
-        which = "live" if args.live else "paper"
-        print(
-            f"WARNING: no update for {age_min:.0f} min: the {which} engine is probably not "
-            f"running. Start it again (it refuses if another copy is still running)."
-        )
+    print(_liveness(path, args.live, settings))
     if data.get("entries_halted"):
         print(f"ENTRIES HALTED: {data['entries_halted']}")
     print(f"open pairs: {len(open_)}")
@@ -485,10 +501,12 @@ def cmd_sweep(args, settings: Settings) -> None:
     }
     df = _mark_current(sweep(_backtester(args, settings), grid, split=args.split), grid)
     with pd.option_context("display.width", 200, "display.max_rows", 200):
-        print(df.head(args.top).to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
-        mine = df[df["yours"] == "*"]
-        if not mine.empty and mine.index[0] >= args.top:  # show it even if it ranks low
-            print(mine.to_string(index=False, header=False, float_format=lambda x: f"{x:,.2f}"))
+        lines = df.to_string(index=False, float_format=lambda x: f"{x:,.2f}").splitlines()
+    print("\n".join(lines[: args.top + 1]))
+    mine = df.index[df["yours"] == "*"]
+    if len(mine) and mine[0] >= args.top:  # show your row even if it ranks low, aligned
+        print("...")
+        print(f"{lines[mine[0] + 1]}   (rank {mine[0] + 1} of {len(df)})")
     print(
         "\nEach row is one combination: train_* is its result on the first part of the data, "
         "test_* on the rest. * marks your current settings. Prefer rows whose test_apr_pct "

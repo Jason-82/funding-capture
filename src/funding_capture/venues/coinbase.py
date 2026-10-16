@@ -313,6 +313,11 @@ class CoinbaseVenue(CcxtVenue):
             return super().place_ioc(inst, order_side, qty, limit_price, reduce_only)
         contracts = round(self.round_qty(inst, qty) / self._unit(inst))
         empty = Fill(inst, order_side, 0.0, limit_price, 0.0, None)
+        if reduce_only:  # no reduce-only flag for these: cap at the open position
+            held = self.fetch_perp_positions().get(inst.key)
+            have = held.qty if held else 0.0
+            reducible = -have if order_side == "buy" else have  # a buy only reduces a short
+            contracts = min(contracts, math.floor(max(0.0, reducible) / self._unit(inst) + 1e-9))
         if contracts < 1:
             return empty
         # an IOC rounds onto the tick grid aggressively (at most one tick past our limit);

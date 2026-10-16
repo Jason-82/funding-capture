@@ -245,11 +245,11 @@ def test_sweep_marks_your_settings_even_with_none_values():
     assert list(out["yours"]) == ["", "", "*"] and list(out.index) == [0, 1, 2]
 
 
-def test_status_flags_a_dead_engine_and_a_halt(tmp_path, capsys):
+def test_status_tells_running_from_stopped_by_the_lock(tmp_path, capsys):
     import os
     import time
 
-    from funding_capture.state import save_json
+    from funding_capture.state import lock_state_dir, save_json
 
     cfg = tmp_path / "c.yaml"
     cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
@@ -257,14 +257,25 @@ def test_status_flags_a_dead_engine_and_a_halt(tmp_path, capsys):
     save_json(path, {"positions": [], "closed": [], "entries_halted": "could not flatten P1"})
     main(["-c", str(cfg), "status", "--live"])
     out = capsys.readouterr().out
-    assert "last update: 0 min ago" in out and "WARNING" not in out
+    assert "WARNING: the live engine is NOT running (last saved 0 min ago)" in out
     assert "ENTRIES HALTED: could not flatten P1" in out
-    old = time.time() - 3600
-    os.utime(path, (old, old))
-    main(["-c", str(cfg), "status", "--live"])
-    assert "WARNING: no update for 60 min: the live engine is probably not running" in (
-        capsys.readouterr().out
-    )
+    with lock_state_dir(path.parent):  # as a running engine holds it
+        main(["-c", str(cfg), "status", "--live"])
+        assert "engine: running, last saved 0 min ago" in capsys.readouterr().out
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+        main(["-c", str(cfg), "status", "--live"])
+        out = capsys.readouterr().out
+        assert "running, last saved 60 min ago" in out and "Leave the exchanges alone" in out
+
+
+def test_misindented_config_line_gets_a_plain_error(tmp_path):
+    from funding_capture.config import load_settings
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("venues:\n  coinbase:\n    quotes: [USD]\n  kinds: [perp]\n")
+    with pytest.raises(ValueError, match=r"venues\.kinds.*spaces in front"):
+        load_settings(cfg)
 
 
 def test_second_engine_exits_with_a_message(tmp_path, monkeypatch):

@@ -101,6 +101,10 @@ class ExecutionReport:
         return any(abs(v) > 0 for v in self.residual.values())
 
 
+class PreTradeError(RuntimeError):
+    """Market data failed before any order was sent: nothing was traded."""
+
+
 class PairExecutor:
     def __init__(
         self,
@@ -122,7 +126,10 @@ class PairExecutor:
             _LegPlan(cand.long, Side.LONG.order_side, False),
             _LegPlan(cand.short, Side.SHORT.order_side, False),
         ]
-        quotes = self._quotes(legs)
+        try:
+            quotes = self._quotes(legs)
+        except Exception as exc:
+            raise PreTradeError(f"no quotes: {exc}") from exc
         mid = (quotes[0].mid + quotes[1].mid) / 2
         return self._execute(legs, notional_usd / mid)
 
@@ -236,7 +243,10 @@ class PairExecutor:
         if m is not None:
             return self._execute_maker(legs[m], legs[1 - m], legs, target_qty)
         rep = ExecutionReport()
-        quotes = self._quotes(legs)
+        try:
+            quotes = self._quotes(legs)
+        except Exception as exc:
+            raise PreTradeError(f"no quotes: {exc}") from exc
         price = quotes[0].mid
         # thinner touch (in USD) goes first: it's the leg most likely to under-fill
         depth = [q.touch(leg.order_side)[1] * q.mid for leg, q in zip(legs, quotes, strict=True)]
@@ -287,7 +297,10 @@ class PairExecutor:
     ) -> ExecutionReport:
         rep = ExecutionReport()
         vm = self.venues[m.inst.venue]
-        ref_mid = self._quotes([m])[0].mid
+        try:
+            ref_mid = self._quotes([m])[0].mid
+        except Exception as exc:
+            raise PreTradeError(f"no quotes: {exc}") from exc
         min_qty = self._min_qty(m, h, ref_mid)
         remaining = target_qty
         rejects = 0

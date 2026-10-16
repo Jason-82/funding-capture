@@ -219,15 +219,25 @@ def test_unwritable_state_blocks_entries_and_quit(tmp_path, clock, monkeypatch, 
     clock.advance(minutes=1)
     w.touch_quotes()
     assert w.engine.step().opened == []  # would open, but the last save failed
-    calls = _quit_after_each_step(w, monkeypatch)
-    w.engine.run(max_steps=3)  # QUIT is refused while the state can't be saved
-    assert len(calls) == 3 and "QUIT ignored" in caplog.text
-    assert not w.engine.positions
-    monkeypatch.undo()  # the file is free again
-    (tmp_path / "QUIT").unlink(missing_ok=True)
-    w.touch_quotes()
-    w.engine.step()  # saves again
-    assert not w.engine._save_failed and (tmp_path / "engine.json").exists()
+    from funding_capture.state import save_json as real_save
+
+    real_step, calls = w.engine.step, []
+
+    def step():
+        calls.append(1)
+        if len(calls) == 3:  # the other program lets go of the file
+            monkeypatch.setattr(engine_mod, "save_json", real_save)
+        rep = real_step()
+        if len(calls) == 1:
+            (tmp_path / "QUIT").touch()  # touched once, while the file can't be written
+        return rep
+
+    monkeypatch.setattr(w.engine, "step", step)
+    w.engine.run(max_steps=10)
+    assert len(calls) == 3 and "QUIT waits" in caplog.text  # then exits without a 2nd QUIT
+    assert not w.engine.positions and not w.engine._save_failed
+    assert (tmp_path / "engine.json").exists()
+    monkeypatch.undo()
     clock.advance(minutes=1)
     w.touch_quotes()
     assert w.engine.step().opened  # entries resume
@@ -325,3 +335,159 @@ def test_engine_estimates_funding_when_venue_cannot_report_it(tmp_path, clock):
     # valued at the leg's mid (100.01) rather than the venue's mark (100.00)
     assert pos.funding_usd == pytest.approx(0.0004 * pos.qty * 100.01)
     assert "funding estimated from published rates" in pos.notes
+
+
+def _open_one(w):
+    rep = w.engine.step()
+    assert len(rep.opened) == 1
+    return w.engine.positions[rep.opened[0]]
+
+
+def _perp_venue(w, pos):
+    inst = pos.candidate.short if pos.candidate.short.is_perp else pos.candidate.long
+    return inst, {"a": w.va, "b": w.vb}[inst.venue]
+
+
+def test_failed_position_read_after_an_open_is_not_taken_as_no_position(
+    tmp_path, clock, monkeypatch
+):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    inst, venue = _perp_venue(w, pos)
+
+    def down():
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(venue, "fetch_perp_positions", down)
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    rep = w.engine.step()
+    assert pos.id in w.engine.positions and rep.closed == []  # not "flattened"
+    assert w.engine.entries_halted == "stale market data"  # soft: lifts next step
+    monkeypatch.undo()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert pos.id in w.engine.positions and w.engine.entries_halted is None
+
+
+def test_untracked_perp_position_halts_entries(tmp_path, clock):
+    w = World(tmp_path, clock)
+    w.engine.executor.trade_one(w.p_b, "sell", 10, False)  # a short no pair accounts for
+    rep = w.engine.step()
+    assert rep.opened == []
+    assert w.engine.entries_halted.startswith("untracked position on b:")
+
+
+def test_failed_close_waits_before_trying_again(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    calls = []
+
+    def broken(*a, **k):
+        calls.append(1)
+        raise RuntimeError("401 Unauthorized")
+
+    monkeypatch.setattr(w.engine.executor, "close", broken)
+    (tmp_path / "FLATTEN").touch()
+    for _ in range(5):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    assert len(calls) == 1 and pos.id in w.engine.positions  # one try, not one a minute
+    clock.advance(minutes=10)
+    w.touch_quotes()
+    w.engine.step()
+    assert len(calls) == 2
+
+
+def test_legs_smaller_than_recorded_are_resized_then_closed(tmp_path, clock):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    cut = pos.qty * 0.05  # as if stopped in the middle of a close: both legs 5% smaller
+    w.engine.executor.trade_one(c.long, "sell", cut, c.long.is_perp)
+    w.engine.executor.trade_one(c.short, "buy", cut, c.short.is_perp)
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert pos.qty == pytest.approx(w.engine.positions[pos.id].qty)
+    assert any("resized to holdings" in n for n in pos.notes)
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    rep = w.engine.step()
+    assert rep.closed == [pos.id]
+    held = {**w.va.fetch_perp_positions(), **w.vb.fetch_perp_positions()}
+    assert held == {}
+
+
+def test_quit_waits_for_flatten_to_finish(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    real, calls = w.engine.step, []
+
+    def step():
+        calls.append(1)
+        rep = real()
+        if len(calls) == 1:  # "close everything, then stop", typed in one go
+            (tmp_path / "FLATTEN").touch()
+            (tmp_path / "QUIT").touch()
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        return rep
+
+    monkeypatch.setattr(w.engine, "step", step)
+    w.engine.run(max_steps=5)
+    assert len(calls) == 2 and not w.engine.positions  # closed in step 2, then exited
+
+
+def test_step_that_trades_then_fails_is_still_saved(tmp_path, clock, monkeypatch):
+    from funding_capture.state import load_json
+
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    real = w.engine.step
+
+    def step():
+        real()  # opens a pair and saves
+        w.engine.positions[next(iter(w.engine.positions))].notes.append("after the save")
+        raise ConnectionError("a later call in the step failed")
+
+    monkeypatch.setattr(w.engine, "step", step)
+    w.engine.run(max_steps=1)  # `fcap paper --steps 1`: returns right after the step
+    saved = load_json(tmp_path / "engine.json")
+    assert saved["positions"][0]["notes"][-1] == "after the save"
+
+
+def test_no_quotes_before_an_order_is_not_a_serious_halt(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+
+    def down(inst):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(w.va, "fetch_touch", down)
+    rep = w.engine.step()
+    assert rep.opened == [] and w.engine.entries_halted is None
+
+
+def test_pair_traded_this_step_is_not_judged_on_positions_read_before(tmp_path, clock, monkeypatch):
+    from funding_capture.execution import ExecutionReport
+
+    w = World(tmp_path, clock)
+    spot_perp = Construction.SPOT_PERP  # a stale perp reading shows up as drift here
+    w.engine.candidates = [c for c in w.engine.candidates if c.construction is spot_perp]
+    pos = _open_one(w)
+    ex = w.engine.executor
+
+    def half_close(cand, qty, urgent=False):
+        rep = ExecutionReport()
+        rep.fills.append(ex.trade_one(cand.long, "sell", qty / 2, cand.long.is_perp))
+        rep.fills.append(ex.trade_one(cand.short, "buy", qty / 2, cand.short.is_perp))
+        return rep
+
+    monkeypatch.setattr(ex, "close", half_close)
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()  # FLATTEN closes half; the positions read at the start show it all
+    assert pos.id in w.engine.positions
+    assert not any(n.startswith("flattened") for n in pos.notes)

@@ -45,6 +45,11 @@ class Settings:
 
 
 def _build(cls, data: dict | None, section: str, **extra):
+    if data is not None and not isinstance(data, dict):
+        raise ValueError(
+            f"config [{section}]: expected settings indented below it, got {data!r}. "
+            "Check the spaces in front of those lines in config.yaml"
+        )
     data = dict(data or {})
     names = {f.name for f in dataclasses.fields(cls)}
     unknown = set(data) - names

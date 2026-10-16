@@ -81,8 +81,9 @@ def check_position(
             f"legs badly mismatched: long {held_long:.6g} short {held_short:.6g} "
             f"(expected {pos.qty:.6g}); possible liquidation/ADL",
         )
-    elif drift > limits.max_delta_drift:
-        add(Action.REBALANCE, "delta", f"delta drift {drift:.2%} of position")
+    elif drift > limits.max_delta_drift or missing > limits.max_delta_drift:
+        # also when both legs shrank alike (stopped mid-close): the record must shrink too
+        add(Action.REBALANCE, "delta", f"delta drift {drift:.2%}, {missing:.2%} missing")
 
     # 2. liquidation distance on perp legs
     for name, leg, inst in (

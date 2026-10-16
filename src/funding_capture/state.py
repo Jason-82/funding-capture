@@ -63,7 +63,7 @@ class StateLocked(RuntimeError):
 
 
 @contextmanager
-def lock_state_dir(state_dir: str | Path) -> Iterator[None]:
+def lock_state_dir(state_dir: str | Path, retries: int = 0) -> Iterator[None]:
     """Hold an OS lock on ``<state_dir>/engine.lock`` while the block runs.
 
     Two engines on one state file would each trade and overwrite the other's positions.
@@ -73,18 +73,23 @@ def lock_state_dir(state_dir: str | Path) -> Iterator[None]:
     d.mkdir(parents=True, exist_ok=True)
     f = open(d / "engine.lock", "a+")  # noqa: SIM115 (held open for the whole block)
     try:
-        try:
-            if os.name == "nt":
-                import msvcrt
+        for attempt in range(retries + 1):  # retries: a `status` probe holds it briefly
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise StateLocked(f"another engine is already running on {d}") from exc
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if attempt == retries:
+                    msg = f"another engine is already running on {d.as_posix()}"
+                    raise StateLocked(msg) from exc
+                time.sleep(0.2)
         try:
             yield
         finally:

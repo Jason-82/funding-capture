@@ -78,6 +78,8 @@ jobs:
             echo "a second paper engine was allowed to start"; exit 1
           fi
           grep "already running" logs/second.txt
+          fcap -c config.yaml status > logs/status-running.txt
+          grep "engine: running" logs/status-running.txt
           touch state/paper/QUIT
           for i in $(seq 1 30); do kill -0 $pid 2>/dev/null || break; sleep 2; done
           if kill -0 $pid 2>/dev/null; then echo "engine did not exit"; kill $pid; exit 1; fi
@@ -87,7 +89,8 @@ jobs:
           touch state/paper/QUIT
           fcap -c config.yaml --log-file logs/paper.log paper --steps 1
           grep "removed a QUIT file left over" logs/paper.log
-          fcap -c config.yaml status
+          fcap -c config.yaml status > logs/status-stopped.txt
+          grep "engine is NOT running" logs/status-stopped.txt
       - name: Keys command in Git Bash (fake keys, separate env file)
         run: |
           source .venv/Scripts/activate

@@ -263,3 +263,25 @@ def test_cli_builds_coinbase_venue_from_us_config():
     assert isinstance(venues["coinbase"], CoinbaseVenue)
     assert venues["coinbase"].quotes == ("USD", "USDC")
     assert venues["kraken"].kinds == {Kind.SPOT}
+
+
+def test_reduce_only_never_buys_more_than_the_open_short(cb):
+    v, insts = cb
+    btc = insts["BIP-20DEC30-CDE"]
+    v.ex.positions = [
+        {
+            "product_id": "BIP-20DEC30-CDE",
+            "side": "SHORT",
+            "number_of_contracts": "2",
+            "avg_entry_price": "70000",
+            "current_price": "71525",
+        }
+    ]
+    f = v.place_ioc(btc, "buy", 0.05, 71600, reduce_only=True)  # 5 contracts asked
+    assert v.ex.sent[-1]["order_configuration"]["sor_limit_ioc"]["base_size"] == "2"
+    assert f.qty == pytest.approx(0.02)
+    sent = len(v.ex.sent)
+    assert v.place_ioc(btc, "sell", 0.05, 71500, reduce_only=True).qty == 0  # a short
+    v.ex.positions = []
+    assert v.place_ioc(btc, "buy", 0.05, 71600, reduce_only=True).qty == 0  # nothing open
+    assert len(v.ex.sent) == sent  # neither was sent
