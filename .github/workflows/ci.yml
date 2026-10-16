@@ -68,18 +68,26 @@ jobs:
           ls -R data | head -40
           fcap -c config.yaml --log-file logs/paper.log paper --steps 2
           fcap -c config.yaml status
-      - name: QUIT file ends a running engine (runbook "Stopping")
+      - name: One engine per state folder; QUIT ends it; a leftover QUIT is ignored
         run: |
           source .venv/Scripts/activate
           fcap -c config.yaml --log-file logs/paper.log paper &
           pid=$!
           sleep 45
+          if fcap -c config.yaml paper --steps 1 2> logs/second.txt; then
+            echo "a second paper engine was allowed to start"; exit 1
+          fi
+          grep "already running" logs/second.txt
           touch state/paper/QUIT
           for i in $(seq 1 30); do kill -0 $pid 2>/dev/null || break; sleep 2; done
           if kill -0 $pid 2>/dev/null; then echo "engine did not exit"; kill $pid; exit 1; fi
           wait $pid
           test ! -e state/paper/QUIT
           grep "QUIT file found" logs/paper.log
+          touch state/paper/QUIT
+          fcap -c config.yaml --log-file logs/paper.log paper --steps 1
+          grep "removed a QUIT file left over" logs/paper.log
+          fcap -c config.yaml status
       - name: Keys command in Git Bash (fake keys, separate env file)
         run: |
           source .venv/Scripts/activate

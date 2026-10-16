@@ -223,5 +223,60 @@ def test_status_shows_annualised_return(tmp_path, capsys):
     )
     main(["-c", str(cfg), "status"])
     out = capsys.readouterr().out
-    assert "running for 10.0 days" in out
+    assert "first started 10.0 days ago" in out
     assert "annualised return on capital so far: +36.5%" in out  # $10 on $1k in 10 days
+
+
+def test_sweep_marks_your_settings_even_with_none_values():
+    import pandas as pd
+
+    from funding_capture.cli import _mark_current
+
+    grid = {"entry_apr": [0.15, 0.1], "forecast.anchor_halflife_hours": [None, 720]}
+    df = pd.DataFrame(
+        {
+            "entry_apr": [0.1, 0.15, 0.15],
+            "forecast.anchor_halflife_hours": [720, 720, None],
+            "train_apr_pct": [9.0, 5.0, 1.0],
+        },
+        index=[2, 0, 1],  # sweep's order: sorted by train_apr_pct, index not reset
+    )
+    out = _mark_current(df, grid)
+    assert list(out["yours"]) == ["", "", "*"] and list(out.index) == [0, 1, 2]
+
+
+def test_status_flags_a_dead_engine_and_a_halt(tmp_path, capsys):
+    import os
+    import time
+
+    from funding_capture.state import save_json
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
+    path = tmp_path / "state" / "live" / "engine.json"
+    save_json(path, {"positions": [], "closed": [], "entries_halted": "could not flatten P1"})
+    main(["-c", str(cfg), "status", "--live"])
+    out = capsys.readouterr().out
+    assert "last update: 0 min ago" in out and "WARNING" not in out
+    assert "ENTRIES HALTED: could not flatten P1" in out
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    main(["-c", str(cfg), "status", "--live"])
+    assert "WARNING: no update for 60 min: the live engine is probably not running" in (
+        capsys.readouterr().out
+    )
+
+
+def test_second_engine_exits_with_a_message(tmp_path, monkeypatch):
+    from funding_capture import cli
+    from funding_capture.state import StateLocked
+
+    class Busy:
+        def run(self, max_steps=None):
+            raise StateLocked("another engine is already running on state/paper")
+
+    monkeypatch.setattr(cli, "_engine", lambda settings, live: Busy())
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
+    with pytest.raises(SystemExit, match="window \\(PAPER\\) is still open.*/QUIT"):
+        main(["-c", str(cfg), "paper", "--steps", "1"])

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
 
@@ -54,3 +56,43 @@ def save_json(path: str | Path, data: dict) -> None:
 def load_json(path: str | Path) -> dict | None:
     path = Path(path)
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+class StateLocked(RuntimeError):
+    """Another engine process already runs on this state directory."""
+
+
+@contextmanager
+def lock_state_dir(state_dir: str | Path) -> Iterator[None]:
+    """Hold an OS lock on ``<state_dir>/engine.lock`` while the block runs.
+
+    Two engines on one state file would each trade and overwrite the other's positions.
+    The OS drops the lock when the process ends, even if it is killed, so it never goes
+    stale the way a PID file would."""
+    d = Path(state_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    f = open(d / "engine.lock", "a+")  # noqa: SIM115 (held open for the whole block)
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise StateLocked(f"another engine is already running on {d}") from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":  # closing would release it too, but not at once
+                import msvcrt
+
+                with suppress(OSError):
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        f.close()

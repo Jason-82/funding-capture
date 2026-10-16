@@ -147,11 +147,110 @@ def test_stop_file_blocks_entries_and_flatten_closes(tmp_path, clock):
     assert w.engine.entries_halted
 
 
-def test_quit_file_ends_run_between_steps(tmp_path, clock):
-    w = World(tmp_path, clock)
-    (tmp_path / "QUIT").touch()
-    w.engine.run()  # no step limit: only the QUIT file ends it
+def _quit_after_each_step(w, monkeypatch, first=1):
+    real, calls = w.engine.step, []
+
+    def step():
+        calls.append(1)
+        rep = real()
+        if len(calls) >= first:
+            (w.tmp_path / "QUIT").touch()  # as if the user touched it during this step
+        return rep
+
+    monkeypatch.setattr(w.engine, "step", step)
+    return calls
+
+
+def test_quit_file_ends_run_between_steps(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    (tmp_path / "QUIT").touch()  # left over from an earlier stop: must not end this run
+    calls = _quit_after_each_step(w, monkeypatch, first=2)
+    w.engine.run(max_steps=5)
+    assert len(calls) == 2  # step 2 finished, then the QUIT made during it ended the run
     assert not (tmp_path / "QUIT").exists()  # removed, so the next start runs normally
+
+
+def test_second_engine_on_the_same_state_is_refused(tmp_path, clock):
+    from funding_capture.state import StateLocked, lock_state_dir
+
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    with lock_state_dir(tmp_path), pytest.raises(StateLocked):
+        w.engine.run(max_steps=1)
+    w.engine.run(max_steps=1)  # released again
+
+
+def test_serious_halt_survives_stop_file_and_stale_data(tmp_path, clock):
+    from funding_capture.engine import StepReport
+    from funding_capture.risk import Action, RiskAlert
+
+    w = World(tmp_path, clock)
+    serious = "unhedged residual or execution error opening X"
+    w.engine.entries_halted = serious
+    (tmp_path / "STOP").touch()
+    w.engine.step()
+    (tmp_path / "STOP").unlink()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().opened == [] and w.engine.entries_halted == serious
+    stale, fresh = StepReport(), StepReport()
+    stale.alerts = [RiskAlert(Action.HALT, "data", "stale data from a")]
+    w.engine._handle_alerts(stale, clock.ms)
+    w.engine._handle_alerts(fresh, clock.ms)  # data back
+    assert w.engine.entries_halted == serious
+    w.engine.entries_halted = None  # a soft halt still lifts by itself
+    w.engine._handle_alerts(stale, clock.ms)
+    assert w.engine.entries_halted == "stale market data"
+    w.engine._handle_alerts(fresh, clock.ms)
+    assert w.engine.entries_halted is None
+
+
+def test_unwritable_state_blocks_entries_and_quit(tmp_path, clock, monkeypatch, caplog):
+    import funding_capture.engine as engine_mod
+
+    def locked(path, data):
+        raise PermissionError(13, "in use by another process", str(path))
+
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    monkeypatch.setattr(engine_mod, "save_json", locked)
+    (tmp_path / "STOP").touch()
+    w.engine.step()  # opens nothing (STOP); its save fails
+    (tmp_path / "STOP").unlink()
+    assert w.engine._save_failed and "cannot write" in caplog.text
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().opened == []  # would open, but the last save failed
+    calls = _quit_after_each_step(w, monkeypatch)
+    w.engine.run(max_steps=3)  # QUIT is refused while the state can't be saved
+    assert len(calls) == 3 and "QUIT ignored" in caplog.text
+    assert not w.engine.positions
+    monkeypatch.undo()  # the file is free again
+    (tmp_path / "QUIT").unlink(missing_ok=True)
+    w.touch_quotes()
+    w.engine.step()  # saves again
+    assert not w.engine._save_failed and (tmp_path / "engine.json").exists()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().opened  # entries resume
+
+
+def test_cooldowns_survive_a_restart(tmp_path, clock):
+    w = World(tmp_path, clock)
+    w.engine._cooldown_until = {"a:BTC": clock.ms + HOUR, "a:OLD": clock.ms - 1}
+    w.engine._venue_blocked_until = {"b": clock.ms + HOUR}
+    w.engine._save()
+    again = w.new_engine()
+    assert again._cooldown_until == {"a:BTC": clock.ms + HOUR}
+    assert again._venue_blocked_until == {"b": clock.ms + HOUR}
+
+
+def test_each_summary_line_is_logged_with_a_time(tmp_path, clock, caplog):
+    import logging
+
+    w = World(tmp_path, clock)
+    with caplog.at_level(logging.INFO, logger="funding_capture"):
+        w.engine._log_step(w.engine.step())
+    assert caplog.records[-1].getMessage().startswith("realised net P&L")
+    assert all("\n" not in r.getMessage() for r in caplog.records)
 
 
 def test_stale_venue_halts_entries(tmp_path, clock):

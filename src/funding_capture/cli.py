@@ -178,6 +178,17 @@ def cmd_status(args, settings: Settings) -> None:
     open_ = [position_from_dict(d) for d in data.get("positions", [])]
     closed = [position_from_dict(d) for d in data.get("closed", [])]
     print(f"state: {path}")
+    # the engine saves after every step, so an old file means it is not running
+    age_min = (datetime.now(UTC).timestamp() - path.stat().st_mtime) / 60
+    print(f"last update: {age_min:.0f} min ago")
+    if age_min > max(10.0, 3 * settings.portfolio.loop_seconds / 60):
+        which = "live" if args.live else "paper"
+        print(
+            f"WARNING: no update for {age_min:.0f} min: the {which} engine is probably not "
+            f"running. Start it again (it refuses if another copy is still running)."
+        )
+    if data.get("entries_halted"):
+        print(f"ENTRIES HALTED: {data['entries_halted']}")
     print(f"open pairs: {len(open_)}")
     for p in open_:
         age_h = (datetime.now(UTC).timestamp() * 1000 - p.opened_ms) / 3_600_000
@@ -204,7 +215,7 @@ def cmd_status(args, settings: Settings) -> None:
     if started:
         days = (datetime.now(UTC).timestamp() * 1000 - started) / 86_400_000
         total = realised + running
-        print(f"running for {days:.1f} days on ${capital:,.0f} of capital")
+        print(f"first started {days:.1f} days ago, on ${capital:,.0f} of capital")
         if days >= 1:
             print(
                 f"annualised return on capital so far: {total / capital * 365 / days:+.1%}"
@@ -437,22 +448,52 @@ def cmd_backtest(args, settings: Settings) -> None:
         print(f"trades written to {args.trades}")
 
 
+def _mark_current(df, grid: dict[str, list]):
+    """Rank order kept, index reset, and a ``yours`` column with * on the row whose values
+    are the first of each grid list (the config's own settings)."""
+    import pandas as pd
+
+    df = df.reset_index(drop=True)
+
+    def same(a, b) -> bool:  # pandas stores a None setting as NaN
+        return bool(pd.isna(a)) if b is None else a == b
+
+    current = {k: v[0] for k, v in grid.items()}
+    marks = [
+        "*" if all(same(r[k], v) for k, v in current.items()) else "" for _, r in df.iterrows()
+    ]
+    df.insert(0, "yours", marks)
+    return df
+
+
 def cmd_sweep(args, settings: Settings) -> None:
     import pandas as pd
 
     from .backtest import sweep
 
+    st = settings.strategy
+
+    def around(current, *others):  # your setting plus alternatives, no repeats
+        return list(dict.fromkeys([current, *others]))
+
     grid = {
-        "entry_apr": [0.10, 0.20, 0.40],
-        "exit_apr": [-0.05, 0.0],
-        "horizon_hours": [72, 168, 336],
-        "forecast.reversion_halflife_hours": [24, 72, 240],
-        "forecast.anchor_halflife_hours": [None, 720],
+        "entry_apr": around(st.entry_apr, 0.10, 0.20, 0.30),
+        "exit_apr": around(st.exit_apr, -0.05, 0.0),
+        "horizon_hours": around(st.horizon_hours, 336, 720, 1440),
+        "forecast.reversion_halflife_hours": around(st.forecast.reversion_halflife_hours, 72, 240),
+        "forecast.anchor_halflife_hours": around(st.forecast.anchor_halflife_hours, None, 720),
     }
-    df = sweep(_backtester(args, settings), grid, split=args.split)
+    df = _mark_current(sweep(_backtester(args, settings), grid, split=args.split), grid)
     with pd.option_context("display.width", 200, "display.max_rows", 200):
         print(df.head(args.top).to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
-    print("\nChoose by test_apr_pct stability, not by the best train row.")
+        mine = df[df["yours"] == "*"]
+        if not mine.empty and mine.index[0] >= args.top:  # show it even if it ranks low
+            print(mine.to_string(index=False, header=False, float_format=lambda x: f"{x:,.2f}"))
+    print(
+        "\nEach row is one combination: train_* is its result on the first part of the data, "
+        "test_* on the rest. * marks your current settings. Prefer rows whose test_apr_pct "
+        "is good and close to train_apr_pct; don't just take the top row."
+    )
 
 
 def _state_dir(settings: Settings, live: bool) -> str:
@@ -501,8 +542,21 @@ def _engine(settings: Settings, live: bool):
     )
 
 
+def _run_engine(settings: Settings, live: bool, steps: int | None) -> None:
+    from .state import StateLocked
+
+    try:
+        _engine(settings, live=live).run(max_steps=steps)
+    except StateLocked as exc:
+        d = _state_dir(settings, live).replace("\\", "/")
+        sys.exit(
+            f"{exc}: its window ({'LIVE' if live else 'PAPER'}) is still open. Use that one, "
+            f"or stop it with `touch {d}/QUIT` and wait for its $ prompt."
+        )
+
+
 def cmd_paper(args, settings: Settings) -> None:
-    _engine(settings, live=False).run(max_steps=args.steps)
+    _run_engine(settings, live=False, steps=args.steps)
 
 
 def cmd_live(args, settings: Settings) -> None:
@@ -511,7 +565,7 @@ def cmd_live(args, settings: Settings) -> None:
             "live trading needs `mode: live` in the config AND "
             "--i-understand-this-trades-real-money. Paper trade first."
         )
-    _engine(settings, live=True).run(max_steps=args.steps)
+    _run_engine(settings, live=True, steps=args.steps)
 
 
 def main(argv: list[str] | None = None) -> None:

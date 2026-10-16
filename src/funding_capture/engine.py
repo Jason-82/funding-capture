@@ -38,8 +38,12 @@ from .opportunities import (
     should_exit,
 )
 from .risk import Action, LegView, RiskAlert, RiskLimits, check_position, price_divergence
-from .state import load_json, position_from_dict, position_to_dict, save_json
+from .state import load_json, lock_state_dir, position_from_dict, position_to_dict, save_json
 from .venues.base import Venue
+
+# Halts that lift by themselves once their cause is gone. Any other reason (an unconfirmed
+# order, an unhedged residual) means the real exposure is unknown: it holds until a restart.
+_SOFT_HALTS = ("STOP file present", "FLATTEN file present", "stale market data")
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +115,7 @@ class Engine:
         self._funding_checked_ms = 0
         self._seq = 0
         self._started_ms: int | None = None  # first step ever (kept across restarts)
+        self._save_failed = False  # state file not writable: no new pairs until it is
         self.state_path = Path(config.state_dir) / "engine.json"
 
     # ------------------------------------------------------------------ setup
@@ -152,20 +157,34 @@ class Engine:
 
     # ------------------------------------------------------------------ main loop
     def run(self, max_steps: int | None = None) -> None:
-        self.bootstrap()
-        n = 0
-        while max_steps is None or n < max_steps:
-            started = self.clock()
-            try:
-                rep = self.step()
-                self._log_step(rep)
-            except Exception:
-                log.exception("step failed; continuing")
-            n += 1
-            if max_steps is not None and n >= max_steps:
-                return
-            if self._wait_or_quit(max(0.0, self.cfg.loop_seconds - (self.clock() - started))):
-                return
+        with lock_state_dir(self.cfg.state_dir):  # StateLocked if another engine runs here
+            quit_file = Path(self.cfg.state_dir) / "QUIT"
+            if quit_file.exists():  # from a stop the last engine never saw: not for us
+                quit_file.unlink(missing_ok=True)
+                log.warning("removed a QUIT file left over from an earlier stop")
+            self.bootstrap()
+            n = 0
+            while max_steps is None or n < max_steps:
+                started = self.clock()
+                try:
+                    rep = self.step()
+                    self._log_step(rep)
+                except Exception:
+                    log.exception("step failed; continuing")
+                n += 1
+                if max_steps is not None and n >= max_steps:
+                    return
+                if self._wait_or_quit(max(0.0, self.cfg.loop_seconds - (self.clock() - started))):
+                    if self._save_failed:
+                        self._save()
+                    if not self._save_failed:
+                        return
+                    log.critical(
+                        "QUIT ignored: %s could not be written, and exiting now would lose "
+                        "track of positions. Close the program holding it, then touch QUIT "
+                        "again",
+                        self.state_path,
+                    )
 
     def _wait_or_quit(self, seconds: float) -> bool:
         """Sleep between steps; True if a QUIT file asks for a clean exit (it is removed,
@@ -302,13 +321,18 @@ class Engine:
     def _kill_switches(self, rep: StepReport, now: int) -> None:
         d = Path(self.cfg.state_dir)
         if (d / "FLATTEN").exists():
-            self.entries_halted = "FLATTEN file present"
+            self._soft_halt("FLATTEN file present")
             for pos in list(self.positions.values()):
                 self._close(pos, "kill switch: FLATTEN", rep, now, urgent=True)
         elif (d / "STOP").exists():
-            self.entries_halted = "STOP file present"
-        elif self.entries_halted and self.entries_halted.endswith("file present"):
+            self._soft_halt("STOP file present")
+        elif self.entries_halted in ("STOP file present", "FLATTEN file present"):
             self.entries_halted = None
+
+    def _soft_halt(self, why: str) -> None:
+        """Halt for a reason that lifts by itself, without hiding a serious halt."""
+        if self.entries_halted is None or self.entries_halted in _SOFT_HALTS:
+            self.entries_halted = why
 
     def _leg_view(self, inst: Instrument) -> LegView:
         if inst.is_perp:
@@ -364,7 +388,7 @@ class Engine:
     def _handle_alerts(self, rep: StepReport, now: int) -> None:
         data_halt = any(a.action is Action.HALT for a in rep.alerts)
         if data_halt:
-            self.entries_halted = "stale market data"
+            self._soft_halt("stale market data")
         elif self.entries_halted == "stale market data":
             self.entries_halted = None
         by_pos: dict[str, list[RiskAlert]] = {}
@@ -545,7 +569,7 @@ class Engine:
 
     # ------------------------------------------------------------------ entries
     def _entries(self, scored: dict[str, Scored], rep: StepReport, now: int) -> None:
-        if self.entries_halted:
+        if self.entries_halted or self._save_failed:
             return
         cfg = self.cfg
         if len(self.positions) >= cfg.max_positions:
@@ -670,8 +694,22 @@ class Engine:
             "started_ms": self._started_ms,
             "capital_usd": self.cfg.capital_usd,
             "venues": {n: v.to_dict() for n, v in self.venues.items() if hasattr(v, "to_dict")},
+            "cooldown_until": self._cooldown_until,
+            "venue_blocked_until": self._venue_blocked_until,
+            # for `fcap status`; not restored, so a restart clears it
+            "entries_halted": self.entries_halted,
         }
-        save_json(self.state_path, data)
+        try:
+            save_json(self.state_path, data)
+        except OSError as exc:
+            self._save_failed = True
+            log.critical(
+                "cannot write %s (%s): no new pairs until it can; close the program holding it",
+                self.state_path,
+                exc,
+            )
+        else:
+            self._save_failed = False
 
     def _load(self) -> None:
         data = load_json(self.state_path)
@@ -682,6 +720,10 @@ class Engine:
         self.forecaster.load_dict(data.get("forecaster", {}))
         self._seq = data.get("seq", 0)
         self._started_ms = data.get("started_ms")
+        now = int(self.clock() * 1000)
+        for name in ("cooldown_until", "venue_blocked_until"):
+            live = {k: int(v) for k, v in (data.get(name) or {}).items() if int(v) > now}
+            setattr(self, "_" + name, live)
         for n, vd in (data.get("venues") or {}).items():
             v = self.venues.get(n)
             if v is not None and hasattr(v, "load_dict"):
@@ -710,4 +752,5 @@ class Engine:
                 best.net_apr_on_capital * 100,
                 best.gross_apr_now * 100,
             )
-        log.info(self.summary())
+        for line in self.summary().splitlines():  # one record per line: each gets a time
+            log.info("%s", line)
