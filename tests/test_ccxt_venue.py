@@ -446,6 +446,69 @@ def test_kraken_order_whose_reply_was_lost_is_found_by_our_id(monkeypatch):
     )
     v.ex.fetch_closed_orders = lambda *a: []
     assert v.place_post_only(btc, "buy", 0.01, 59_000) == "O9"  # carried on with, not lost
-    v.ex.fetch_open_orders = lambda *a: []  # never placed: the error is raised
-    with pytest.raises(ccxt.RequestTimeout):
+
+
+def test_kraken_lost_reply_never_assumes_the_order_is_gone(monkeypatch):
+    """Not finding the order right after a lost reply doesn't prove Kraken refused it: it
+    can still show up and rest (post-only) or execute (IOC). So the post-only is cancelled
+    by our id and the outcome is unknown; only Kraken's own refusal codes skip that."""
+    import funding_capture.venues.ccxt_venue as cv
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr(cv.time, "sleep", lambda s: None)
+    v = _kraken()
+    btc = next(i for i in v.load_instruments() if i.asset == "BTC")
+    sent, cancels, reads = {}, [], {"n": 0}
+
+    def create(symbol, type_, side, amount, price, params):
+        sent["cid"] = params["clientOrderId"]
+        raise sent["exc"]
+
+    def open_orders(symbol, since, limit, params):
+        reads["n"] += 1
+        return []
+
+    v.ex.create_order = create
+    v.ex.fetch_open_orders = open_orders
+    v.ex.fetch_closed_orders = lambda *a: []
+    v.ex.cancel_order = lambda oid, symbol, params: cancels.append(params["clientOrderId"])
+
+    sent["exc"] = ccxt.RequestTimeout("reply lost")
+    with pytest.raises(OrderOutcomeUnknown, match="Open orders"):
         v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert cancels == [sent["cid"]]  # pulled by our id in case it shows up later
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_ioc(btc, "buy", 0.01, 61_000)
+
+    # lookups that fail don't count as "not there": six failed reads are still unknown
+    def flaky(symbol, since, limit, params):
+        reads["n"] += 1
+        raise ccxt.RequestTimeout("lookup lost too")
+
+    v.ex.fetch_open_orders, reads["n"], cancels[:] = flaky, 0, []
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert reads["n"] == 6 and cancels == [sent["cid"]]
+    # two failed reads then three clean misses: five reads, not cut short at three
+    left = {"fail": 2}
+
+    def mixed(symbol, since, limit, params):
+        reads["n"] += 1
+        if left["fail"]:
+            left["fail"] -= 1
+            raise ccxt.RequestTimeout("lookup lost")
+        return []
+
+    v.ex.fetch_open_orders, reads["n"] = mixed, 0
+    assert v._find_by_client_id(btc, "x") is None and reads["n"] == 5
+
+    # Kraken's own refusal (busy, rate limit) means the order was never taken: no lookup
+    v.ex.fetch_open_orders, reads["n"], cancels[:] = open_orders, 0, []
+    for refused in (
+        ccxt.ExchangeNotAvailable('kraken {"error":["EService:Busy"]}'),
+        ccxt.DDoSProtection('kraken {"error":["EAPI:Rate limit exceeded"]}'),
+    ):
+        sent["exc"] = refused
+        with pytest.raises(type(refused)):
+            v.place_post_only(btc, "buy", 0.01, 59_000)
+    assert reads["n"] == 0 and not cancels

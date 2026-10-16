@@ -832,3 +832,34 @@ def test_open_that_was_unwound_records_its_cost(tmp_path, clock, monkeypatch):
     (lost,) = w.engine.closed
     assert lost.qty == 0 and lost.entry_fees_usd == pytest.approx(1.2)
     assert lost.net_pnl_usd == pytest.approx(-1.2 - 0.8)  # fees plus 2 x $0.40 spread
+
+
+def test_open_whose_hedge_fill_is_unconfirmed_owns_the_filled_leg(tmp_path, clock):
+    """The spot buy is confirmed, the perp sell fills on the exchange but its reply is
+    lost. The pair is recorded at the confirmed leg's size (not zero), so the hedge that
+    did fill is tracked and FLATTEN later closes both legs instead of leaving them."""
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    w = _spot_perp_world(tmp_path, clock)
+    real = w.va.place_ioc
+
+    def dark(inst, side, qty, limit, reduce_only=False):
+        fill = real(inst, side, qty, limit, reduce_only)
+        if inst.is_perp and not reduce_only:
+            raise OrderOutcomeUnknown("a: IOC fill could not be confirmed")
+        return fill
+
+    w.va.place_ioc = dark
+    w.engine.step()
+    held = w.va.fetch_spot_balance(w.s_a)
+    assert held > 0 and w.va.fetch_perp_positions()[w.p_a.key].qty == pytest.approx(-held)
+    (pos,) = w.engine.positions.values()
+    assert pos.qty == pytest.approx(held)
+    assert w.engine.entries_halted  # unsafe: a person checks before more entries
+
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().closed == [pos.id]
+    assert w.va.fetch_perp_positions() == {}
+    assert w.va.fetch_spot_balance(w.s_a) == pytest.approx(0, abs=1e-9)

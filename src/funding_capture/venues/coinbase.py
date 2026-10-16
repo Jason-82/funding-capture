@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from datetime import datetime
@@ -38,8 +39,8 @@ log = logging.getLogger(__name__)
 _FINAL_STATES = {"FILLED", "CANCELLED", "EXPIRED", "FAILED"}  # anything else may still fill
 # gRPC-gateway error bodies ccxt raises as plain ExchangeError: transient, worth a retry
 _TRANSIENT = {"INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"}
-# of those, the ones after which a create may have gone through
-_AMBIGUOUS = {"INTERNAL", "DEADLINE_EXCEEDED"}
+# of those, the ones after which a create may have gone through anyway
+_AMBIGUOUS = {"INTERNAL", "DEADLINE_EXCEEDED", "UNAVAILABLE"}
 
 
 def _error_code(exc) -> str:
@@ -309,7 +310,7 @@ class CoinbaseVenue(CcxtVenue):
             "order_configuration": {config_name: cfg},
         }
         ambiguous = False  # some try may have placed the order without us hearing back
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 # resending the same client_order_id returns the existing order instead of
                 # placing a second one, so a reply lost to a timeout is safe to retry
@@ -323,14 +324,19 @@ class CoinbaseVenue(CcxtVenue):
                     raise
                 ambiguous |= isinstance(exc, ccxt.RequestTimeout) or code in _AMBIGUOUS
                 ambiguous |= type(exc) is ccxt.NetworkError  # e.g. the connection dropped
-                if attempt == 3:
+                # a bare 5xx page (proxy, load balancer) can follow an order that went in;
+                # ccxt words it '<id> <method> <url> <status> ...'
+                ambiguous |= isinstance(exc, ccxt.ExchangeNotAvailable) and bool(
+                    re.match(r"\S+ \S+ \S+ 5\d\d ", str(exc))
+                )
+                if attempt == 5:
                     if ambiguous:
                         raise OrderOutcomeUnknown(
                             f"coinbase order {body['client_order_id']} may have been placed"
                         ) from exc
                     raise
                 log.warning("coinbase order %s: %s; resending", body["client_order_id"], exc)
-                time.sleep(1.0)
+                time.sleep(min(2.0**attempt, 8.0))  # 1, 2, 4, 8, 8 s: outlast a short outage
         raise RuntimeError("unreachable")
 
     def _retry(self, fn, what: str, tries: int = 5):

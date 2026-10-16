@@ -905,10 +905,17 @@ class Engine:
             self.entries_halted = f"unhedged residual or execution error opening {c.key}"
             log.critical("after open %s: residual %s, messages %s", c.key, ex.residual, ex.messages)
         long_px, short_px = ex.avg_price(c.long, "buy"), ex.avg_price(c.short, "sell")
-        qty = min(
+        legs = (
             ex.qty(c.long, "buy") - ex.qty(c.long, "sell"),
             ex.qty(c.short, "sell") - ex.qty(c.short, "buy"),
         )
+        qty = min(legs)
+        if ex.unknown:
+            # a hedge may have filled without confirmation: own all that a leg is known to
+            # hold, so the next step's fresh read of both legs settles it (flattening what
+            # turns out unhedged) instead of trading a filled hedge back as "excess"
+            qty = max(legs)
+            long_px, short_px = long_px or short_px, short_px or long_px
         unwound = 0.0  # price P&L of what was bought or sold and then traded back
         for inst, side, back, sgn in ((c.long, "buy", "sell", 1), (c.short, "sell", "buy", -1)):
             first, then = ex.avg_price(inst, side), ex.avg_price(inst, back)

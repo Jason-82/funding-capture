@@ -424,6 +424,28 @@ def test_gateway_errors_are_retried_and_an_ambiguous_create_is_unknown(cb, monke
     api.v3PrivatePostBrokerageOrders = always("DEADLINE_EXCEEDED")  # may have gone through
     with pytest.raises(OrderOutcomeUnknown):
         v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
-    api.v3PrivatePostBrokerageOrders = always("UNAVAILABLE")  # surely never placed
+    api.v3PrivatePostBrokerageOrders = always("UNAVAILABLE")  # the gateway may have sent it on
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+    posts = []
+
+    def bare(status):  # how ccxt words a proxy's error page: '<id> <method> <url> <status> ...'
+        def fail(body):
+            posts.append(body["client_order_id"])
+            raise ccxt.ExchangeNotAvailable(
+                f"coinbase POST https://api.coinbase.com/api/v3/brokerage/orders {status} "
+                f"Bad Gateway <html>{status}</html>"
+            )
+
+        return fail
+
+    api.v3PrivatePostBrokerageOrders = bare(502)  # the order may be behind the proxy
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+    assert len(posts) == 6 and len(set(posts)) == 1  # resent under the same id each time
+    api.v3PrivatePostBrokerageOrders = always("RESOURCE_EXHAUSTED")  # rate limit: never placed
+    with pytest.raises(ccxt.ExchangeError):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+    api.v3PrivatePostBrokerageOrders = always("INVALID_ARGUMENT")
     with pytest.raises(ccxt.ExchangeError):
         v.place_ioc(shib, "buy", 10_000_000, 0.0000056)

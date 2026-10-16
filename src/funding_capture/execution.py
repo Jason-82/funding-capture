@@ -78,6 +78,7 @@ class ExecutionReport:
     residual: dict[str, float] = field(default_factory=dict)  # instrument key -> signed qty
     complete: bool = False
     messages: list[str] = field(default_factory=list)
+    unknown: bool = False  # an order's fill could not be confirmed: nothing traded back
     # something went wrong in a way that leaves the true exposure uncertain (venue error,
     # an order that could not be confirmed cancelled): the engine halts entries on this
     unsafe: bool = False
@@ -227,7 +228,7 @@ class PairExecutor:
         record what is left and whether the execution did what was asked. When an order's
         fill is unknown nothing is traded back: the excess may already be hedged."""
         if unknown:
-            rep.unsafe = True
+            rep.unsafe = rep.unknown = True
             rep.messages.append(
                 "an order's fill could not be confirmed, so nothing was traded back: compare "
                 "the perp position with the spot balance on both exchanges and close what "
@@ -388,8 +389,8 @@ class PairExecutor:
                             raise
                         if not self._absorb(m, h, final, seen, carry, rep, hedge=not failed):
                             failed, reason = True, "hedge failed"
-                        if final.is_open:
-                            rep.unsafe = True
+                        if final.is_open:  # never rest a second order next to this one
+                            rep.unsafe = failed = True
                             rep.messages.append(f"order {oid} on {m.inst.key} may still be open")
                 remaining -= seen.qty
                 if seen.qty > 0:

@@ -330,3 +330,34 @@ def test_unconfirmed_hedge_is_never_traded_back_maker_path():
     # the second 10 are NOT hedged on top of an order whose fill is unknown
     assert vb.fetch_perp_positions()[cand.short.key].qty == pytest.approx(-10)
     assert rep.unsafe and any("nothing was traded back" in m for m in rep.messages)
+
+
+def test_maker_order_whose_cancel_did_not_land_is_not_joined_by_a_second():
+    """A cancel that leaves the order open means two orders could rest at once if the
+    loop re-quoted: it stops instead, and says which order to check."""
+    from funding_capture.models import OrderState
+
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    t = [0.0]
+    ex = PairExecutor(
+        {"a": va, "b": vb},
+        ExecutionParams(max_slice_usd=5_000, maker_timeout_s=600, maker_poll_s=10),
+        maker_venues=("a",),
+        sleep=lambda sec: t.__setitem__(0, t[0] + sec),
+        clock=lambda: t[0],
+    )
+    placed = []
+    real_post = va.place_post_only
+
+    def post(*a, **kw):
+        oid = real_post(*a, **kw)
+        placed.append(oid)
+        da.set_quote(cand.long, 100.9, 101.1, size=1_000)  # the market runs away: re-quote
+        return oid
+
+    va.place_post_only = post
+    va.fetch_order_state = lambda inst, oid: OrderState(oid, 0.0, 0.0, 0.0, True)
+    va.cancel_order = lambda inst, oid: OrderState(oid, 0.0, 0.0, 0.0, True)  # didn't land
+    rep = ex.open(cand, 1_010)
+    assert len(placed) == 1
+    assert rep.unsafe and any("may still be open" in m for m in rep.messages)

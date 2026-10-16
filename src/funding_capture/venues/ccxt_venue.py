@@ -98,6 +98,20 @@ def merged_opt(exchange, key: str):
     return (getattr(exchange, "options", None) or {}).get(key)
 
 
+def _maybe_placed(exc: Exception) -> bool:
+    """After a create failed with a network error, could the order exist anyway? Not when
+    the exchange answered with its own refusal (Kraken: EService:Busy/Unavailable, rate
+    limits); yes after a timeout, a dropped connection or a bare 5xx page."""
+    import ccxt
+
+    if isinstance(exc, (ccxt.DDoSProtection, ccxt.InvalidNonce)):
+        return False
+    refused = isinstance(exc, ccxt.ExchangeNotAvailable) and any(
+        code in str(exc) for code in ("EService:", "EGeneral:", "EAPI:")
+    )
+    return not refused
+
+
 class CcxtVenue(Venue):
     def __init__(
         self,
@@ -434,13 +448,24 @@ class CcxtVenue(Venue):
         cid = self._client_id(params)
         try:
             order = self.ex.create_order(inst.symbol, "limit", order_side, amount, px, params)
-        except ccxt.NetworkError:
-            # the exchange may have taken the order although the reply was lost: find it
-            # by our id and carry on with it (or confirm it isn't there) before giving up
-            found = self._find_by_client_id(inst, cid) if cid else None
-            if found is None:
-                raise
-            order = found
+        except ccxt.NetworkError as exc:
+            if not (cid and _maybe_placed(exc)):
+                raise  # the exchange said it refused it (or we can't look it up)
+            # the reply was lost: find the order by our id and carry on with it
+            try:
+                order = self._find_by_client_id(inst, cid)
+            except OrderOutcomeUnknown:
+                order = None
+            if order is None:  # it may still appear and rest on the book: pull it
+                with contextlib.suppress(Exception):
+                    self._retry(
+                        lambda: self.ex.cancel_order(None, inst.symbol, {"clientOrderId": cid}),
+                        "cancel_order",
+                    )
+                raise OrderOutcomeUnknown(
+                    f"{self.name}: {order_side} order {cid} on {inst.symbol} may be resting on "
+                    f"the book: cancel it under Open orders on {self.name}"
+                ) from exc
         except ccxt.OrderImmediatelyFillable:
             return None
         except ccxt.InvalidOrder as exc:  # venues word "would cross" rejections differently
@@ -503,9 +528,10 @@ class CcxtVenue(Venue):
         import ccxt
 
         p = {"clientOrderId": cid}
-        for i in range(5):
+        misses = 0
+        for i in range(6):
             if i:
-                time.sleep(0.5 * 2 ** (i - 1))
+                time.sleep(min(0.5 * 2 ** (i - 1), 4.0))
             try:
                 hits = self.ex.fetch_open_orders(inst.symbol, None, None, dict(p))
                 hits = hits or self.ex.fetch_closed_orders(inst.symbol, None, None, dict(p))
@@ -515,7 +541,8 @@ class CcxtVenue(Venue):
             if hits:
                 log.warning("%s: order %s was placed although its reply was lost", self.name, cid)
                 return hits[0]
-            if i >= 2:  # asked three times with no network error: it isn't there
+            misses += 1
+            if misses >= 3:  # not there on three clean reads (it may still show up later)
                 return None
         raise OrderOutcomeUnknown(f"{self.name}: could not tell whether order {cid} was placed")
 
@@ -586,11 +613,14 @@ class CcxtVenue(Venue):
         cid = self._client_id(params)
         try:
             order = self.ex.create_order(inst.symbol, "limit", order_side, amount, price, params)
-        except ccxt.NetworkError:
-            found = self._find_by_client_id(inst, cid) if cid else None
-            if found is None:
+        except ccxt.NetworkError as exc:
+            if not (cid and _maybe_placed(exc)):
                 raise
-            order = found
+            order = self._find_by_client_id(inst, cid)
+            if order is None:  # not seen yet, but it may still execute: never assume zero
+                raise OrderOutcomeUnknown(
+                    f"{self.name}: IOC {cid} on {inst.symbol} may have executed"
+                ) from exc
         except ccxt.InvalidOrder as exc:
             # Hyperliquid reports an IOC with nothing to match as an error, not a 0 fill
             if "immediately match" in str(exc).lower():
