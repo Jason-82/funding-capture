@@ -100,7 +100,7 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`117 passed`** (the number may be higher after updates)
+* `pytest -q` should end with **`126 passed`** (the number may be higher after updates)
   and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate
@@ -475,6 +475,10 @@ The bot doesn't check each exchange's cash separately, only `capital_usd`. A pai
 bought its coin on Coinbase would need about $1,200 there (the coin plus the margin),
 which is why 4b keeps Coinbase to the short.
 
+**Keep your own coins off this Kraken account** (at least the 24 coins in the Background
+table): move them to another exchange or a wallet first. When something goes wrong the
+bot can't tell its coins from yours, and it may sell yours to fix a pair.
+
 ### 4b. Switch the config to live, sized to one contract
 
 ```
@@ -580,12 +584,12 @@ the bot has stopped).
 | You want to | Do this |
 |---|---|
 | pause new trades (keep managing open ones) | `touch state/live/STOP` (resume: `rm state/live/STOP`) |
-| close everything now | `touch state/live/FLATTEN` (trade again later: `rm state/live/FLATTEN`). If `logs/live.log` keeps showing `did not close; next try in 10 min` for a pair, `rm state/live/FLATTEN`, stop the bot with QUIT and close both legs of that pair by hand |
+| close everything now | `touch state/live/FLATTEN` (trade again later: `rm state/live/FLATTEN`). If `logs/live.log` keeps showing `did not close (try …)` for a pair, `rm state/live/FLATTEN`, stop the bot with QUIT, close both legs of that pair by hand, then `fcap -c config.yaml forget --live <pair id>` (the id from `status --live`, like `P1760000000-1`) before starting it again |
 | stop for good (close everything, then exit) | `touch state/live/FLATTEN` and `touch state/live/QUIT`. The bot closes every pair first (QUIT waits for that), then exits. When the LIVE window shows the `$` prompt, check both exchanges show no position, then `rm state/live/FLATTEN` |
 | stop the program | `touch state/live/QUIT`, then wait until the LIVE window shows the `$` prompt. That is usually within a minute, but can take several minutes while it is opening or closing a pair, because it never stops halfway through an order. Only then close the window. Open pairs stay open and are managed again when you restart |
 | restart the PC (e.g. to install updates) | `touch state/live/QUIT`, wait for the `$` prompt in the LIVE window, restart, then start LIVE again (4c), then RECORD and PAPER (step 7) |
 | the PC restarted by itself (power cut, crash, update), or the LIVE window is gone | this is an unclean stop: do the checks below, then start LIVE again (4c), then RECORD and PAPER (step 7) |
-| `status --live`, the LIVE window or `logs/live.log` shows `ENTRIES HALTED:` with any reason other than `STOP file present`, `FLATTEN file present` or `stale market data` | the bot hit something it won't guess about (an order it couldn't confirm, a leg left over, or `untracked position on …`: a Coinbase position no pair accounts for). It keeps managing open pairs but opens none. Stop it with QUIT, do the checks below, fix by hand, restart. If the reason mentions a network error or timeout, first wait until `fcap -c config.yaml check` passes for both exchanges |
+| `status --live`, the LIVE window or `logs/live.log` shows `ENTRIES HALTED:` with any reason other than `STOP file present`, `FLATTEN file present` or `stale market data` | the bot hit something it won't guess about (an order it couldn't confirm, a leg left over, `close of … keeps failing`, or `untracked position on …`: a Coinbase position no pair accounts for). It keeps managing open pairs but opens none. Stop it with QUIT, do the checks below, fix by hand, restart. If the reason mentions a network error or timeout, first wait until `fcap -c config.yaml check` passes for both exchanges |
 | `fcap … live` says `another engine is already running` | a LIVE window is still open (hover over the Git Bash icon in the taskbar). Use that one; never run two |
 
 **Don't stop the live bot with Ctrl + C or the window's ✕.** In Git Bash both kill it
@@ -608,6 +612,9 @@ starting it again:
    the larger one (note `rebalanced`); if both are smaller by the same amount it shrinks
    its record (note `resized to holdings`). If you also hold that coin yourself on that
    exchange, paste the details to Claude first.
+5. If you closed both legs of a pair by hand, remove it from the bot's record before
+   starting it again: `fcap -c config.yaml forget --live <pair id>`. Otherwise the bot
+   sees the legs gone and may sell coins of that kind that are still on the account.
 
 ### Daily routine once live
 
@@ -702,6 +709,7 @@ fcap -c config.yaml sweep
 fcap -c config.yaml paper
 fcap -c config.yaml live --i-understand-this-trades-real-money
 fcap -c config.yaml status [--live]
+fcap -c config.yaml forget [--live] PAIR_ID     drop a pair you closed by hand (bot stopped)
 global options go right after `fcap`, before the command name:
   -c FILE   -v (debug)   --log-file FILE   --env-file FILE (default .env)
   right: fcap -c config.yaml --log-file logs/paper.log paper

@@ -46,8 +46,11 @@ fcap -c config.yaml sweep
 # 5. Paper trade on live data with simulated fills and funding
 fcap -c config.yaml paper
 
-# 6. Positions and P&L of the running (or last) paper engine
+# 6. Positions and P&L of the running (or last) paper engine, and whether it runs
 fcap -c config.yaml status
+
+# A pair you closed by hand: drop it from the record (with the engine stopped)
+fcap -c config.yaml forget --live P1760000000-1
 
 # Venues with no funding-history API (Coinbase US perps): log it forward, or import a CSV
 fcap -c config.yaml record

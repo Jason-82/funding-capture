@@ -291,3 +291,29 @@ def test_second_engine_exits_with_a_message(tmp_path, monkeypatch):
     cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
     with pytest.raises(SystemExit, match="window \\(PAPER\\) is still open.*/QUIT"):
         main(["-c", str(cfg), "paper", "--steps", "1"])
+
+
+def test_forget_drops_a_pair_closed_by_hand(tmp_path, capsys):
+    from funding_capture.models import Candidate, PairPosition
+    from funding_capture.state import load_json, lock_state_dir, position_to_dict, save_json
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"portfolio:\n  state_dir: {tmp_path / 'state'}\n")
+    pos = PairPosition(
+        "P1",
+        Candidate(Construction.SPOT_PERP, "BTC", spot("k"), perp("h")),
+        0.1,
+        100.0,
+        100.0,
+        T0,
+    )
+    path = tmp_path / "state" / "live" / "engine.json"
+    save_json(path, {"positions": [position_to_dict(pos)], "closed": []})
+    with lock_state_dir(path.parent), pytest.raises(SystemExit, match="stop it with QUIT"):
+        main(["-c", str(cfg), "forget", "--live", "P1"])
+    with pytest.raises(SystemExit, match=r"no open pair P9 .*open pairs: P1"):
+        main(["-c", str(cfg), "forget", "--live", "P9"])
+    main(["-c", str(cfg), "forget", "--live", "P1"])
+    data = load_json(path)
+    assert data["positions"] == [] and data["closed"][0]["id"] == "P1"
+    assert "fcap forget" in data["closed"][0]["notes"][-1]

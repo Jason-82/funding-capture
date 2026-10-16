@@ -133,6 +133,16 @@ class CoinbaseVenue(CcxtVenue):
     def load_instruments(self) -> list[Instrument]:
         if self._by_symbol:
             return list(self._by_symbol.values())
+        try:
+            self._load_all()
+        except Exception:
+            # all or nothing: a half-filled cache (spot without the perps) would be
+            # returned as complete next time, and positions on the perps go unseen
+            self._by_symbol = {}
+            raise
+        return list(self._by_symbol.values())
+
+    def _load_all(self) -> None:
         if Kind.SPOT in self.kinds:
             super().load_instruments()  # spot via ccxt; ccxt's CDE markets are skipped there
             # ccxt also lists Coinbase International's perps (BTC/USDC:USDC, AAPL/USDC:USDC)
@@ -152,7 +162,6 @@ class CoinbaseVenue(CcxtVenue):
                 self._by_symbol[pid] = Instrument(
                     self.name, pid, asset, Kind.PERP, "USD", mult, size
                 )
-        return list(self._by_symbol.values())
 
     def fetch_funding(self, instruments=None) -> dict[str, FundingSnapshot]:
         perps = self._perps(instruments)

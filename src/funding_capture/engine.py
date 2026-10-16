@@ -44,9 +44,19 @@ from .venues.base import Venue
 # Halts that lift by themselves once their cause is gone. Any other reason (an unconfirmed
 # order, an unhedged residual) means the real exposure is unknown: it holds until a restart.
 _SOFT_HALTS = ("STOP file present", "FLATTEN file present", "stale market data")
-_CLOSE_RETRY_MS = 10 * 60_000  # wait after a failed close: a retry may pay the same fees
+_CLOSE_RETRY_MS = 10 * 60_000  # first wait after a close that paid fees and closed nothing
+_CLOSE_HALT_AFTER = 3  # such failures in a row: halt entries and say so
 
 log = logging.getLogger(__name__)
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """Startup errors that retrying won't fix: a bad state file or key, or a bug."""
+    import ccxt
+
+    permanent = (ValueError, TypeError, KeyError, AttributeError)
+    permanent += (ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.AccountSuspended)
+    return isinstance(exc, permanent)
 
 
 @dataclass(frozen=True)
@@ -120,6 +130,7 @@ class Engine:
         self._positions_fresh: set[str] = set()  # venues whose perp positions this step read
         self._touched: set[str] = set()  # pairs traded this step: cached positions are stale
         self._close_blocked_until: dict[str, int] = {}  # pair id -> ms, after a failed close
+        self._close_fails: dict[str, int] = {}  # pair id -> failed closes in a row
         self._untracked_seen: set[str] = set()
         self.state_path = Path(config.state_dir) / "engine.json"
 
@@ -219,9 +230,13 @@ class Engine:
                 self.bootstrap()
                 return True
             except Exception as exc:
-                if attempt == 29:
-                    raise
-                log.warning("startup failed (%s); retrying in %.0f s", exc, delay)
+                if attempt == 29 or _is_permanent(exc):
+                    raise  # a bad state file, a bad key or a bug: waiting won't fix it
+                log.error(
+                    "startup failed (%s); NOT managing positions yet; retrying in %.0f s",
+                    exc,
+                    delay,
+                )
                 if self._wait_or_quit(delay):
                     log.warning("QUIT file found during startup: exiting")
                     return False
@@ -252,6 +267,7 @@ class Engine:
             v.tick(now)
             v.heartbeat()
         self.refresh(now)
+        self._check_untracked()  # on this reading, before anything in this step trades
         self._account(now)
         self._kill_switches(rep, now)
         rep.alerts = self._risk(now)
@@ -421,7 +437,6 @@ class Engine:
             alerts.append(
                 RiskAlert(Action.HALT, "data", f"positions unknown on {', '.join(sorted(unknown))}")
             )
-        self._check_untracked()
         alerts.extend(self._account_margin_alerts(stale, now))
         return alerts
 
@@ -551,8 +566,12 @@ class Engine:
         if down:
             log.warning("cannot close %s now (%s): no fresh data from %s", pos.id, reason, down)
             return
-        qty = self._closable_qty(pos)
         self._touched.add(pos.id)
+        qty, held = self._closable_qty(pos)
+        if len(held) == 2 and abs(held[0] - held[1]) > self.limits.max_delta_drift * pos.qty:
+            # legs differ (partly liquidated, or closed by hand): close each for what it holds
+            self._flatten(pos, reason, rep, now)
+            return
         try:
             ex = self.executor.close(c, qty, urgent=urgent)
         except PreTradeError as exc:  # nothing was sent
@@ -589,54 +608,87 @@ class Engine:
                 if inst.is_perp:
                     self._sweep_dust(inst, pos)
             rep.closed.append(pos.id)
+            self._forget_reading(pos)
+            self._close_fails.pop(pos.id, None)
             log.info("CLOSED %s (%s) net $%.2f", pos.id, reason, pos.net_pnl_usd)
         else:
             pos.qty -= done
             pos.notes.append(f"partial close {done:.6g}: {reason}")
-            self._close_failed(pos, now)
+            if ex.unsafe or ex.has_residual or (done <= 0 and ex.fees_usd > 0):
+                self._close_failed(pos, now)  # paid fees for nothing, or exposure unclear
+            else:  # progress, or nothing spent (orders didn't fill): try again next step
+                self._close_fails.pop(pos.id, None)
+                log.warning("%s: closed %.6g of %.6g; trying the rest next step", pos.id, done, qty)
 
     def _close_failed(self, pos: PairPosition, now: int) -> None:
-        self._close_blocked_until[pos.id] = now + _CLOSE_RETRY_MS
+        """Wait before the next try (10, 20, 40, 80, then 160 min), since each failed try
+        may pay the spot fees twice; after a few, halt entries so a person looks."""
+        n = self._close_fails[pos.id] = self._close_fails.get(pos.id, 0) + 1
+        wait = _CLOSE_RETRY_MS * 2 ** min(n - 1, 4)
+        self._close_blocked_until[pos.id] = now + wait
         log.critical(
-            "%s did not close; next try in %d min. If this repeats, `rm` FLATTEN if present, "
-            "stop the bot with QUIT and close both legs by hand",
+            "%s did not close (try %d, exit fees so far $%.2f); next try in %d min. If this "
+            "repeats, `rm` FLATTEN if present, stop the bot with QUIT, close both legs by hand, "
+            "then `fcap forget %s`",
             pos.id,
-            _CLOSE_RETRY_MS // 60_000,
+            n,
+            pos.exit_fees_usd,
+            wait // 60_000,
+            pos.id,
         )
+        if n >= _CLOSE_HALT_AFTER and (
+            self.entries_halted is None or self.entries_halted in _SOFT_HALTS
+        ):
+            self.entries_halted = f"close of {pos.id} keeps failing ({n} tries)"
 
-    def _closable_qty(self, pos: PairPosition) -> float:
-        """pos.qty, capped at what the accounts still hold (a stop in the middle of a close
-        can leave both legs smaller than the record; selling more than is held fails)."""
-        qty = pos.qty
+    def _closable_qty(self, pos: PairPosition) -> tuple[float, list[float]]:
+        """pos.qty capped at what the accounts still hold (a stop in the middle of a close
+        can leave both legs smaller than the record; selling more than is held fails), and
+        the holdings read per leg (spot counted up to pos.qty), for spotting a mismatch."""
+        qty, held = pos.qty, []
         for inst in (pos.candidate.long, pos.candidate.short):
             try:
                 if inst.is_perp:
                     p = self.venues[inst.venue].fetch_perp_positions().get(inst.key)
-                    held = abs(p.qty) if p else 0.0
+                    h = abs(p.qty) if p else 0.0
                 else:
-                    held = self.venues[inst.venue].fetch_spot_balance(inst)
+                    h = min(self.venues[inst.venue].fetch_spot_balance(inst), pos.qty)
             except Exception as exc:
                 log.warning(
                     "%s: holdings of %s unavailable (%s); using the record", pos.id, inst.key, exc
                 )
                 continue
-            if 0 < held < qty:
-                qty = held
+            held.append(h)
+            if 0 < h < qty:
+                qty = h
         if qty < pos.qty * 0.999:
             log.warning("%s: closing %.6g held, not the %.6g recorded", pos.id, qty, pos.qty)
-        return qty
+        return qty, held
+
+    def _forget_reading(self, pos: PairPosition) -> None:
+        """The positions read at the start of this step are out of date for a pair just
+        closed: drop them, so nothing later in the step judges by them."""
+        for inst in (pos.candidate.long, pos.candidate.short):
+            self._perp_positions.pop(inst.key, None)
 
     def _flatten(self, pos: PairPosition, reason: str, rep: StepReport, now: int) -> None:
         """Close each leg on its own, for what is actually held (used when legs mismatch)."""
         c = pos.candidate
         flat = True
         self._touched.add(pos.id)
-        for inst, sign in ((c.long, 1), (c.short, -1)):
-            if inst.is_perp:  # read now, not from the start of the step
-                p = self.venues[inst.venue].fetch_perp_positions().get(inst.key)
-                held = sign * (p.qty if p else 0.0)
-            else:
-                held = min(sign * self._leg_view(inst).qty, pos.qty)
+        legs = ((c.long, 1), (c.short, -1))
+        try:  # read both legs before trading either, and now, not at the start of the step
+            helds = []
+            for inst, sign in legs:
+                if inst.is_perp:
+                    p = self.venues[inst.venue].fetch_perp_positions().get(inst.key)
+                    helds.append(sign * (p.qty if p else 0.0))
+                else:
+                    helds.append(min(sign * self._leg_view(inst).qty, pos.qty))
+        except Exception as exc:
+            log.error("flatten %s: holdings unavailable (%s); trying next step", pos.id, exc)
+            return
+        for (inst, sign), held in zip(legs, helds, strict=True):
             if held <= 0:
                 continue
             side = "sell" if sign > 0 else "buy"
@@ -657,6 +709,8 @@ class Engine:
             pos.notes.append(f"flattened: {reason}")
             self.closed.append(self.positions.pop(pos.id))
             rep.closed.append(pos.id)
+            self._forget_reading(pos)
+            self._close_fails.pop(pos.id, None)
             log.warning("FLATTENED %s (%s)", pos.id, reason)
         else:
             self.entries_halted = f"could not flatten {pos.id}"
@@ -686,8 +740,10 @@ class Engine:
         held_short = -sv.qty if c.short.is_perp else min(-sv.qty, pos.qty)
         diff = held_long - held_short
         inst = c.long if diff > 0 else c.short
-        if self.venues[inst.venue].round_qty(inst, abs(diff)) <= 0:
-            # legs match but are smaller than recorded (e.g. stopped mid-close): resize
+        v, mark = self.venues[inst.venue], self._mark(inst) or pos.long_entry
+        q = v.round_qty(inst, abs(diff))
+        if q <= 0 or q < v.min_qty(inst) or q * mark < v.min_notional(inst) * 1.1:
+            # legs match within one order but are smaller than recorded (stopped mid-close)
             pos.qty = min(held_long, held_short)
             pos.notes.append(f"resized to holdings: {pos.qty:.6g}")
             return

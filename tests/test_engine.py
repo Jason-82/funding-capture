@@ -491,3 +491,149 @@ def test_pair_traded_this_step_is_not_judged_on_positions_read_before(tmp_path, 
     w.engine.step()  # FLATTEN closes half; the positions read at the start show it all
     assert pos.id in w.engine.positions
     assert not any(n.startswith("flattened") for n in pos.notes)
+
+
+def _spot_perp_world(tmp_path, clock, **cfg):
+    w = World(tmp_path, clock, **cfg)
+    spot_perp = Construction.SPOT_PERP
+    w.engine.candidates = [c for c in w.engine.candidates if c.construction is spot_perp]
+    return w
+
+
+def test_flatten_close_raises_no_false_untracked_halt(tmp_path, clock, caplog):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().closed == [pos.id]
+    assert w.engine.entries_halted == "FLATTEN file present"
+    assert "untracked" not in caplog.text
+    (tmp_path / "FLATTEN").unlink()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert w.engine.entries_halted is None
+
+
+def _report(ex, fills=(), fees=0.0):
+    from funding_capture.execution import ExecutionReport
+    from funding_capture.models import Fill
+
+    rep = ExecutionReport()
+    rep.fills.extend(fills)
+    if fees:  # e.g. a first leg sold and bought back: fees paid, nothing closed
+        inst = ex.venues["a"].load_instruments()[0]
+        rep.fills.append(Fill(inst, "sell", 0.0, 100.0, fees))
+    return rep
+
+
+def test_close_that_spent_nothing_is_retried_next_step(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    calls = []
+
+    def no_fill(cand, qty, urgent=False):
+        calls.append(1)
+        return _report(w.engine.executor)  # IOCs missed / maker timed out: no fees
+
+    monkeypatch.setattr(w.engine.executor, "close", no_fill)
+    (tmp_path / "FLATTEN").touch()
+    for _ in range(3):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    assert len(calls) == 3 and pos.id in w.engine.positions
+
+
+def test_close_that_pays_fees_for_nothing_backs_off_longer_then_halts(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    calls = []
+
+    def churn(cand, qty, urgent=False):
+        calls.append(clock.ms)
+        return _report(w.engine.executor, fees=1.0)
+
+    monkeypatch.setattr(w.engine.executor, "close", churn)
+    (tmp_path / "FLATTEN").touch()
+    for _ in range(80):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    gaps = [(b - a) // 60_000 for a, b in zip(calls, calls[1:], strict=False)]
+    assert gaps[:3] == [10, 20, 40]
+    assert w.engine.entries_halted == f"close of {pos.id} keeps failing (3 tries)"
+
+
+def test_flatten_with_legs_of_different_size_sells_all_the_spot(tmp_path, clock):
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    w.engine.executor.trade_one(c.short, "buy", pos.qty * 0.5, True)  # half the short gone
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().closed == [pos.id]
+    venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    assert venue.fetch_spot_balance(c.long) == pytest.approx(0, abs=1e-9)
+    assert {**w.va.fetch_perp_positions(), **w.vb.fetch_perp_positions()} == {}
+
+
+def test_flatten_trades_nothing_when_a_leg_cannot_be_read(tmp_path, clock, monkeypatch):
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    spot_venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    perp_venue = {"a": w.va, "b": w.vb}[c.short.venue]
+    before = spot_venue.fetch_spot_balance(c.long)
+
+    def down():
+        raise TimeoutError("cfm/positions timed out")
+
+    monkeypatch.setattr(perp_venue, "fetch_perp_positions", down)
+    from funding_capture.engine import StepReport
+
+    w.engine._flatten(pos, "test", StepReport(), clock.ms)
+    assert spot_venue.fetch_spot_balance(c.long) == before and pos.id in w.engine.positions
+
+
+def test_startup_retries_outages_but_not_a_broken_state_file(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock, loop_seconds=0.01)
+    monkeypatch.setattr(w.engine, "_wait_or_quit", lambda seconds: False)
+    real, tries = w.engine.bootstrap, []
+
+    def flaky():
+        tries.append(1)
+        if len(tries) == 1:
+            raise TimeoutError("exchange down")
+        real()
+
+    monkeypatch.setattr(w.engine, "bootstrap", flaky)
+    w.engine.run(max_steps=1)
+    assert len(tries) == 2
+    (tmp_path / "engine.json").write_text("{ not json", encoding="utf-8")
+    tries.clear()
+
+    def counted():
+        tries.append(1)
+        real()
+
+    monkeypatch.setattr(w.engine, "bootstrap", counted)
+    with pytest.raises(ValueError):
+        w.engine.run(max_steps=1)
+    assert len(tries) == 1  # no half hour of retries for a file that stays broken
+
+
+def test_dust_difference_below_one_order_resizes_the_record(tmp_path, clock, monkeypatch):
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    w.engine.executor.trade_one(c.long, "sell", pos.qty * 0.05, False)
+    w.engine.executor.trade_one(c.short, "buy", pos.qty * 0.05 - 0.002, True)  # off by dust
+    spot_venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    monkeypatch.setattr(spot_venue, "min_qty", lambda inst: 0.01)  # dust is below one order
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert any(n.startswith("resized to holdings") for n in pos.notes)

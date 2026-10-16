@@ -285,3 +285,30 @@ def test_reduce_only_never_buys_more_than_the_open_short(cb):
     v.ex.positions = []
     assert v.place_ioc(btc, "buy", 0.05, 71600, reduce_only=True).qty == 0  # nothing open
     assert len(v.ex.sent) == sent  # neither was sent
+
+
+def test_failed_perp_load_leaves_nothing_cached():
+    api = FakeCoinbaseAPI()
+    api.load_markets = lambda: {
+        "BTC/USD": {
+            "symbol": "BTC/USD",
+            "spot": True,
+            "quote": "USD",
+            "base": "BTC",
+            "active": True,
+        }
+    }
+    real, calls = api.v3PublicGetBrokerageMarketProducts, []
+
+    def flaky(params):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ccxt.RequestTimeout("market/products timed out")
+        return real(params)
+
+    api.v3PublicGetBrokerageMarketProducts = flaky
+    v = CoinbaseVenue("coinbase", exchange=api, kinds=("spot", "perp"))
+    with pytest.raises(ccxt.RequestTimeout):
+        v.load_instruments()
+    symbols = {i.symbol for i in v.load_instruments()}  # the retry loads everything
+    assert {"BTC/USD", "BIP-20DEC30-CDE"} <= symbols

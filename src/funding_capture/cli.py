@@ -1,5 +1,5 @@
 """Command line: fcap check | keys | markets | scan | record | import-funding | fetch | backtest
-| sweep | paper | live | status."""
+| sweep | paper | live | status | forget."""
 
 from __future__ import annotations
 
@@ -237,6 +237,42 @@ def cmd_status(args, settings: Settings) -> None:
                 f"annualised return on capital so far: {total / capital * 365 / days:+.1%}"
                 "  (noisy until a few weeks have passed)"
             )
+
+
+def cmd_forget(args, settings: Settings) -> None:
+    """Drop a pair you closed by hand from the engine's record. Otherwise, on the next
+    start the bot sees its legs gone and may sell coins of that kind from the account,
+    including coins you own. Refuses while the engine runs."""
+    from pathlib import Path
+
+    from .state import (
+        StateLocked,
+        load_json,
+        lock_state_dir,
+        position_from_dict,
+        position_to_dict,
+        save_json,
+    )
+
+    d = Path(_state_dir(settings, args.live))
+    path = d / "engine.json"
+    try:
+        with lock_state_dir(d):
+            data = load_json(path) or {}
+            positions = data.get("positions", [])
+            match = [p for p in positions if p.get("id") == args.pair_id]
+            if not match:
+                ids = ", ".join(p.get("id", "?") for p in positions) or "none"
+                sys.exit(f"no open pair {args.pair_id} in {path} (open pairs: {ids})")
+            pos = position_from_dict(match[0])
+            pos.closed_ms = int(datetime.now(UTC).timestamp() * 1000)
+            pos.notes.append("closed by hand; removed with `fcap forget`")
+            data["positions"] = [p for p in positions if p.get("id") != args.pair_id]
+            data["closed"] = [*data.get("closed", []), position_to_dict(pos)]
+            save_json(path, data)
+    except StateLocked:
+        sys.exit("the engine is running: stop it with QUIT first, then run forget again")
+    print(f"removed {args.pair_id} from {path}; the bot no longer manages it")
 
 
 def cmd_scan(args, settings: Settings) -> None:
@@ -601,6 +637,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--last", type=int, default=20, help="closed pairs to list")
     s.add_argument("--live", action="store_true", help="show the live engine (default: paper)")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("forget", help="drop a pair you closed by hand from the record")
+    s.add_argument("pair_id", help="the pair's id as `status` shows it, e.g. P1760000000-1")
+    s.add_argument("--live", action="store_true", help="the live engine (default: paper)")
+    s.set_defaults(fn=cmd_forget)
 
     s = sub.add_parser("scan", help="rank live opportunities across venues")
     s.add_argument("--top", type=int, default=25)
