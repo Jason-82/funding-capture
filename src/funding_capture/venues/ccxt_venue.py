@@ -25,7 +25,7 @@ from ..models import (
 )
 from ..rates import DEFAULT_INTERVAL_HOURS, parse_interval_hours
 from ..symbols import canonical_asset
-from .base import Venue
+from .base import OrderOutcomeUnknown, Venue
 
 log = logging.getLogger(__name__)
 
@@ -517,7 +517,7 @@ class CcxtVenue(Venue):
                 return hits[0]
             if i >= 2:  # asked three times with no network error: it isn't there
                 return None
-        raise RuntimeError(f"{self.name}: could not tell whether order {cid} was placed")
+        raise OrderOutcomeUnknown(f"{self.name}: could not tell whether order {cid} was placed")
 
     def _settled(self, inst, order_id, tries: int = 6, pause_s: float = 0.5) -> OrderState:
         """Read an order until the venue reports it closed (cancels can be asynchronous).
@@ -559,7 +559,7 @@ class CcxtVenue(Venue):
             self.ex.cancel_order(oid, inst.symbol)  # an IOC still "open" is pending: end it
         order = read()
         if order is None or order.get("status") in (None, "open"):
-            raise RuntimeError(f"{self.name}: IOC {oid} fill could not be confirmed")
+            raise OrderOutcomeUnknown(f"{self.name}: IOC {oid} fill could not be confirmed")
         return order
 
     def _require_trading(self) -> None:

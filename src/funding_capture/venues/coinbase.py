@@ -30,11 +30,21 @@ from datetime import datetime
 
 from ..models import Fill, FundingSnapshot, Instrument, Kind, OrderState, PerpPositionInfo, Quote
 from ..symbols import canonical_asset
+from .base import OrderOutcomeUnknown
 from .ccxt_venue import CcxtVenue
 
 log = logging.getLogger(__name__)
 
 _FINAL_STATES = {"FILLED", "CANCELLED", "EXPIRED", "FAILED"}  # anything else may still fill
+# gRPC-gateway error bodies ccxt raises as plain ExchangeError: transient, worth a retry
+_TRANSIENT = {"INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"}
+# of those, the ones after which a create may have gone through
+_AMBIGUOUS = {"INTERNAL", "DEADLINE_EXCEEDED"}
+
+
+def _error_code(exc) -> str:
+    body = _json_in(str(exc))
+    return str(body.get("error", "")).upper() if isinstance(body, dict) else ""
 
 
 def _f(value, default: float = 0.0) -> float:
@@ -298,22 +308,45 @@ class CoinbaseVenue(CcxtVenue):
             "side": side.upper(),
             "order_configuration": {config_name: cfg},
         }
+        ambiguous = False  # some try may have placed the order without us hearing back
         for attempt in range(4):
             try:
                 # resending the same client_order_id returns the existing order instead of
                 # placing a second one, so a reply lost to a timeout is safe to retry
                 return self.ex.v3PrivatePostBrokerageOrders(body)
-            except ccxt.NetworkError as exc:
+            except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+                err = _json_in(str(exc))
+                if isinstance(err, dict) and ("error_response" in err or "success" in err):
+                    return err  # a rejection: the caller reads the reason
+                code = _error_code(exc)
+                if not isinstance(exc, ccxt.NetworkError) and code not in _TRANSIENT:
+                    raise
+                ambiguous |= isinstance(exc, ccxt.RequestTimeout) or code in _AMBIGUOUS
+                ambiguous |= type(exc) is ccxt.NetworkError  # e.g. the connection dropped
                 if attempt == 3:
+                    if ambiguous:
+                        raise OrderOutcomeUnknown(
+                            f"coinbase order {body['client_order_id']} may have been placed"
+                        ) from exc
                     raise
                 log.warning("coinbase order %s: %s; resending", body["client_order_id"], exc)
                 time.sleep(1.0)
-            except ccxt.ExchangeError as exc:
-                err = _json_in(str(exc))
-                if isinstance(err, dict) and ("error_response" in err or "success" in err):
-                    return err
-                raise
         raise RuntimeError("unreachable")
+
+    def _retry(self, fn, what: str, tries: int = 5):
+        """As CcxtVenue._retry, also for Coinbase's transient gateway errors, which ccxt
+        raises as plain ExchangeError."""
+        import ccxt
+
+        def call():
+            try:
+                return fn()
+            except ccxt.ExchangeError as exc:
+                if _error_code(exc) in _TRANSIENT:
+                    raise ccxt.ExchangeNotAvailable(str(exc)) from exc
+                raise
+
+        return super()._retry(call, what, tries)
 
     @staticmethod
     def _order_id(resp: dict) -> tuple[str | None, str]:
@@ -365,7 +398,7 @@ class CoinbaseVenue(CcxtVenue):
             self.ex.v3PrivatePostBrokerageOrdersBatchCancel({"order_ids": [oid]})
         st = read()
         if st is None or st.is_open:
-            raise RuntimeError(f"coinbase: IOC {oid} fill could not be confirmed")
+            raise OrderOutcomeUnknown(f"coinbase: IOC {oid} fill could not be confirmed")
         return st
 
     def place_ioc(self, inst, order_side, qty, limit_price, reduce_only=False) -> Fill:

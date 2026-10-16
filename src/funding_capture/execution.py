@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .models import Candidate, Fill, Instrument, OrderState, Side
-from .venues.base import Venue
+from .venues.base import OrderOutcomeUnknown, Venue
 
 log = logging.getLogger(__name__)
 
@@ -221,15 +221,25 @@ class PairExecutor:
         target_qty: float,
         price: float,
         reason: str,
+        unknown: bool = False,
     ) -> ExecutionReport:
         """Flatten any one-sided excess (only ever called with nothing resting), then
-        record what is left and whether the execution did what was asked."""
-        try:
-            self._unwind_excess(legs, rep, price, reason)
-        except Exception as exc:  # the report must still reach the caller
+        record what is left and whether the execution did what was asked. When an order's
+        fill is unknown nothing is traded back: the excess may already be hedged."""
+        if unknown:
             rep.unsafe = True
-            rep.messages.append(f"unwind error: {exc}")
-            log.error("unwind error: %s", exc)
+            rep.messages.append(
+                "an order's fill could not be confirmed, so nothing was traded back: compare "
+                "the perp position with the spot balance on both exchanges and close what "
+                "is unhedged by hand"
+            )
+        else:
+            try:
+                self._unwind_excess(legs, rep, price, reason)
+            except Exception as exc:  # the report must still reach the caller
+                rep.unsafe = True
+                rep.messages.append(f"unwind error: {exc}")
+                log.error("unwind error: %s", exc)
         self._record_residual(legs, rep, price)
         rep.complete = (
             not rep.has_residual
@@ -256,6 +266,7 @@ class PairExecutor:
         a, b = legs[first], legs[second]
         min_qty = self._min_qty(a, b, quotes[first].mid)
         reason = "sub-lot remainder"
+        unknown = False
         remaining = target_qty
         misses = 0
         carry = 0.0  # first-leg fills too small to hedge yet
@@ -301,9 +312,10 @@ class PairExecutor:
         except Exception as exc:
             rep.unsafe = True
             reason = "execution error"
+            unknown = isinstance(exc, OrderOutcomeUnknown)
             rep.messages.append(f"execution error: {exc}")
             log.error("execution error on %s/%s: %s", a.inst.key, b.inst.key, exc)
-        return self._finish(legs, rep, target_qty, price, reason)
+        return self._finish(legs, rep, target_qty, price, reason, unknown)
 
     def _execute_maker(
         self, m: _LegPlan, h: _LegPlan, legs: list[_LegPlan], target_qty: float
@@ -319,7 +331,7 @@ class PairExecutor:
         rejects = 0
         carry = _Carry()
         reason = "sub-lot remainder"
-        failed = timed_out = False
+        failed = timed_out = unknown = False
         started = self.clock()  # one budget across re-quotes; reset only on progress
         try:
             while remaining > 0 and not (failed or timed_out):
@@ -360,6 +372,9 @@ class PairExecutor:
                             continue
                         timed_out = expired  # otherwise: re-price at the new touch
                         break
+                except OrderOutcomeUnknown:
+                    failed = unknown = True  # hedge nothing more on top of an unknown fill
+                    raise
                 finally:
                     if resting:  # never leave our order on the book when we stop looking
                         try:
@@ -393,9 +408,10 @@ class PairExecutor:
         except Exception as exc:
             rep.unsafe = True
             reason = "execution error"
+            unknown = unknown or isinstance(exc, OrderOutcomeUnknown)
             rep.messages.append(f"execution error: {exc}")
             log.error("maker execution error on %s: %s", m.inst.key, exc)
-        return self._finish(legs, rep, target_qty, ref_mid, reason)
+        return self._finish(legs, rep, target_qty, ref_mid, reason, unknown)
 
     def _absorb(
         self,

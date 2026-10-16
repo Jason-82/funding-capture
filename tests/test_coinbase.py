@@ -373,3 +373,57 @@ def test_ioc_fill_is_confirmed_and_a_lost_reply_is_resent_safely(cb, monkeypatch
     api.v3PrivateGetBrokerageOrdersHistoricalOrderId = lambda params: {"order": {}}
     with pytest.raises(RuntimeError, match="could not be confirmed"):
         v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+
+
+def test_gateway_errors_are_retried_and_an_ambiguous_create_is_unknown(cb, monkeypatch):
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    monkeypatch.setattr("funding_capture.venues.coinbase.time.sleep", lambda s: None)
+    monkeypatch.setattr("funding_capture.venues.ccxt_venue.time.sleep", lambda s: None)
+    v, insts = cb
+    shib = insts["SHP-20DEC30-CDE"]
+    api = v.ex
+    real_post, real_get = (
+        api.v3PrivatePostBrokerageOrders,
+        (api.v3PrivateGetBrokerageOrdersHistoricalOrderId),
+    )
+    n = {"post": 1, "get": 1}
+
+    def post(body):  # ccxt raises a gRPC-gateway body as plain ExchangeError
+        if n["post"]:
+            n["post"] -= 1
+            raise ccxt.ExchangeError('coinbase {"error":"INTERNAL","code":13}')
+        return real_post(body)
+
+    def get(params):
+        if n["get"]:
+            n["get"] -= 1
+            raise ccxt.ExchangeError('coinbase {"error":"UNAVAILABLE","code":14}')
+        return real_get(params)
+
+    api.v3PrivatePostBrokerageOrders, api.v3PrivateGetBrokerageOrdersHistoricalOrderId = post, get
+    assert v.place_ioc(shib, "buy", 10_000_000, 0.0000056).qty == pytest.approx(10_000_000)
+
+    def always(code):
+        def fail(body):
+            raise ccxt.ExchangeError(f'coinbase {{"error":"{code}","code":13}}')
+
+        return fail
+
+    real_cancel, n["cancel"] = api.v3PrivatePostBrokerageOrdersBatchCancel, 1
+
+    def cancel(body):
+        if n["cancel"]:
+            n["cancel"] -= 1
+            raise ccxt.ExchangeError('coinbase {"error":"UNAVAILABLE","code":14}')
+        return real_cancel(body)
+
+    api.v3PrivatePostBrokerageOrdersBatchCancel = cancel
+    assert not v.cancel_order(shib, "o1").is_open  # retried, not raised
+
+    api.v3PrivatePostBrokerageOrders = always("DEADLINE_EXCEEDED")  # may have gone through
+    with pytest.raises(OrderOutcomeUnknown):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)
+    api.v3PrivatePostBrokerageOrders = always("UNAVAILABLE")  # surely never placed
+    with pytest.raises(ccxt.ExchangeError):
+        v.place_ioc(shib, "buy", 10_000_000, 0.0000056)

@@ -273,3 +273,60 @@ def test_paper_venue_keeps_positions_on_products_held_back_as_halted():
     v.load_instruments()
     v._apply(v._book(p), -2.0, 100.0)
     assert v.fetch_perp_positions()[p.key].qty == -2
+
+
+def _hedge_fills_then_goes_dark(vb):
+    """The perp IOC fills on the exchange, but its fill can't be confirmed."""
+    from funding_capture.venues.base import OrderOutcomeUnknown
+
+    real = vb.place_ioc
+
+    def dark(inst, side, qty, limit, reduce_only=False):
+        real(inst, side, qty, limit, reduce_only)
+        raise OrderOutcomeUnknown("coinbase: IOC o1 fill could not be confirmed")
+
+    vb.place_ioc = dark
+
+
+def test_unconfirmed_hedge_is_never_traded_back_ioc_path():
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    _hedge_fills_then_goes_dark(vb)
+    ex = PairExecutor({"a": va, "b": vb}, ExecutionParams(max_slice_usd=1_000))
+    rep = ex.open(cand, 1_010)
+    assert va.fetch_spot_balance(cand.long) == pytest.approx(10)  # kept: the short exists
+    assert vb.fetch_perp_positions()[cand.short.key].qty == pytest.approx(-10)
+    assert rep.unsafe and rep.has_residual
+    assert any("nothing was traded back" in m for m in rep.messages)
+
+
+def test_unconfirmed_hedge_is_never_traded_back_maker_path():
+    from funding_capture.models import OrderState
+
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    _hedge_fills_then_goes_dark(vb)
+    t = [0.0]
+    ex = PairExecutor(
+        {"a": va, "b": vb},
+        ExecutionParams(max_slice_usd=5_000, maker_timeout_s=60, maker_poll_s=10),
+        maker_venues=("a",),
+        sleep=lambda sec: t.__setitem__(0, t[0] + sec),
+        clock=lambda: t[0],
+    )
+    done = {}
+
+    def resting_fill(inst, oid):  # 10 of 20 fill while the order still rests
+        if oid not in done:
+            done[oid] = True
+            va._apply(va._book(inst), 10.0, 99.9)
+        return OrderState(oid, 10.0, 99.9, 1.0, True)
+
+    def cancel(inst, oid):  # 10 more fill before the cancel lands
+        va._apply(va._book(inst), 10.0, 99.9)
+        return OrderState(oid, 20.0, 99.9, 2.0, False)
+
+    va.fetch_order_state, va.cancel_order = resting_fill, cancel
+    rep = ex.open(cand, 2_020)
+    assert va.fetch_spot_balance(cand.long) == pytest.approx(20)
+    # the second 10 are NOT hedged on top of an order whose fill is unknown
+    assert vb.fetch_perp_positions()[cand.short.key].qty == pytest.approx(-10)
+    assert rep.unsafe and any("nothing was traded back" in m for m in rep.messages)

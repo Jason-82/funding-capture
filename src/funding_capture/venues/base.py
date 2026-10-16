@@ -8,6 +8,12 @@ from abc import ABC, abstractmethod
 from ..models import FundingSnapshot, Instrument, OrderState, PerpPositionInfo, Quote
 
 
+class OrderOutcomeUnknown(RuntimeError):
+    """An order may have been placed and filled, but that can't be confirmed (replies
+    lost, reads failing). Nothing may be traded back against it: a hedge that did fill
+    would be left naked."""
+
+
 class Venue(ABC):
     name: str
     # False when the venue has no API for funding actually paid; the engine then estimates
