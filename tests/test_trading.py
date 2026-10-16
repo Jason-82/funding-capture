@@ -225,3 +225,47 @@ def test_top_up_below_the_maker_venue_minimum_is_not_an_error():
     va.cancel_order = lambda inst, oid: OrderState(oid, 9.8, 99.9, 1.0, False)
     rep = ex.open(cand, 1_010)
     assert not rep.unsafe and not rep.has_residual  # unwound, but no "execution error"
+
+
+def test_float_noise_just_under_a_contract_still_closes():
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    ex = PairExecutor({"a": va, "b": vb}, ExecutionParams(max_slice_usd=1_000))
+    assert ex.open(cand, 1_010).hedged_qty == pytest.approx(10)
+    import math
+
+    # exchanges truncate strictly (Kraken: 8 decimals), unlike the paper venue's floor
+    va.round_qty = lambda inst, q: math.floor(q * 1e8) / 1e8
+    vb.round_qty = lambda inst, q: math.floor(q / 10) * 10.0
+    qty = 9.999999999999998  # a sum of fills a hair under one contract
+    assert qty < 10
+    rep = ex.close(cand, qty, urgent=True)
+    assert rep.complete and vb.fetch_perp_positions() == {}
+
+
+def test_whole_lot_refused_after_a_top_up_is_reported_as_a_failed_hedge():
+    cand, (da, va), (db, vb) = _whole_contract_pair()
+    ex = PairExecutor({"a": va, "b": vb}, ExecutionParams(max_slice_usd=1_000))
+    ex.open(cand, 1_010)
+    da.set_quote(cand.long, 99.9, 100.1, size=3)
+    real = vb.place_ioc
+    vb.place_ioc = lambda inst, side, qty, limit, reduce_only=False: real(
+        inst,
+        side,
+        qty,
+        1.0 if side == "buy" else limit,
+        reduce_only,  # buys never fill
+    )
+    rep = ex.close(cand, 10, urgent=True)
+    assert any(m.startswith("hedge failed") for m in rep.messages)
+    assert va.fetch_spot_balance(cand.long) == pytest.approx(10)  # sold back, still hedged
+
+
+def test_paper_venue_keeps_positions_on_products_held_back_as_halted():
+    p = perp("a")
+    data = FakeVenue("a", [])
+    data._untradeable = {p.key: p}
+    v = PaperVenue(data, FEES)
+    data.set_quote(p, 100, 100.2)
+    v.load_instruments()
+    v._apply(v._book(p), -2.0, 100.0)
+    assert v.fetch_perp_positions()[p.key].qty == -2

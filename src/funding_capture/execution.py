@@ -171,6 +171,7 @@ class PairExecutor:
 
     def _round_both(self, a: _LegPlan, b: _LegPlan, qty: float) -> float:
         va, vb = self.venues[a.inst.venue], self.venues[b.inst.venue]
+        qty *= 1 + 1e-12  # float noise from summing fills must not lose a lot boundary
         q = va.round_qty(a.inst, qty)
         q = vb.round_qty(b.inst, q)
         return va.round_qty(a.inst, q)
@@ -290,8 +291,13 @@ class PairExecutor:
                     break
             if reason == "sub-lot remainder" and carry > 1e-12:  # fills below one hedge lot
                 c = _Carry(carry)
-                remaining -= self._top_up(a, b, c, rep, remaining)
+                got = self._top_up(a, b, c, rep, remaining)
+                remaining -= got
                 carry = c.qty
+                if self._sendable(b, carry, price) > 0:
+                    reason = "hedge failed"  # the hedge venue refused the whole lot
+                elif got and remaining * price <= self.p.residual_tolerance_usd:
+                    rep.messages = [m for m in rep.messages if not m.startswith("stopped:")]
         except Exception as exc:
             rep.unsafe = True
             reason = "execution error"
@@ -367,6 +373,8 @@ class PairExecutor:
                     started = self.clock()
             if not failed and carry.qty > 1e-12:
                 remaining -= self._top_up(m, h, carry, rep, remaining)
+                if self._sendable(h, carry.qty, ref_mid) > 0:
+                    reason = "hedge failed"  # the hedge venue refused the whole lot
             if timed_out:
                 rep.messages.append(
                     f"maker order on {m.inst.key} timed out; {remaining:.6g} not traded"

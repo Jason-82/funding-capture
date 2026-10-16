@@ -100,7 +100,7 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`138 passed`** (the number may be higher after updates)
+* `pytest -q` should end with **`143 passed`** (the number may be higher after updates)
   and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate

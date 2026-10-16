@@ -757,3 +757,36 @@ def test_close_failure_count_resets_once_no_close_is_wanted(tmp_path, clock):
     w.touch_quotes()
     w.engine.step()  # healthy pair, no exit wanted
     assert pos.id not in w.engine._close_fails and pos.id not in w.engine._close_idle
+
+
+def test_flatten_sells_naked_spot_while_the_empty_perp_has_no_book(tmp_path, clock, monkeypatch):
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    w.engine.executor.trade_one(c.short, "buy", pos.qty, True)  # the short is gone (ADL)
+    perp_venue = {"a": w.va, "b": w.vb}[c.short.venue]
+    spot_venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    real = perp_venue.fetch_touch
+
+    def halted(inst):
+        if inst.is_perp:
+            raise RuntimeError("coinbase BIP is halted or cancel-only")
+        return real(inst)
+
+    monkeypatch.setattr(perp_venue, "fetch_touch", halted)
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()
+    assert spot_venue.fetch_spot_balance(c.long) == pytest.approx(0, abs=1e-9)
+    assert pos.id not in w.engine.positions
+
+
+def test_close_failure_count_survives_a_short_gap_in_risk_alerts(tmp_path, clock):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    w.engine._close_fails[pos.id] = 2
+    w.engine._close_wanted_ms[pos.id] = clock.ms  # a close was wanted a minute ago
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    w.engine.step()  # this step's alert skipped (e.g. a failed read): keep the count
+    assert w.engine._close_fails[pos.id] == 2

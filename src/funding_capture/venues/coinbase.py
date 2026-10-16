@@ -103,10 +103,14 @@ class CoinbaseVenue(CcxtVenue):
 
     @staticmethod
     def _tradeable(p: dict) -> bool:
-        return not any(
-            str(p.get(k)).lower() == "true"
-            for k in ("is_disabled", "trading_disabled", "view_only", "cancel_only")
-        )
+        """False while Coinbase halts the product or reopens it (post-only or auction:
+        the IOC orders the bot sends to perps would be rejected)."""
+        flags = ("is_disabled", "trading_disabled", "view_only", "cancel_only")
+        flags += ("post_only", "auction_mode")
+        if any(str(p.get(k)).lower() == "true" for k in flags):
+            return False
+        session = p.get("fcm_trading_session_details") or {}
+        return str(session.get("is_session_open")).lower() != "false"
 
     @staticmethod
     def _base_unit(p: dict) -> str:

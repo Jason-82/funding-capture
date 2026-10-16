@@ -84,6 +84,9 @@ class PaperVenue(Venue):
     def load_instruments(self) -> list[Instrument]:
         insts = self.data.load_instruments()
         self._instruments = {i.key: i for i in insts}
+        # products the data venue holds back as halted: positions on them must still show
+        for i in (getattr(self.data, "_untradeable", None) or {}).values():
+            self._instruments.setdefault(i.key, i)
         return insts
 
     def fetch_funding(self, instruments=None) -> dict[str, FundingSnapshot]:

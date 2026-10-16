@@ -134,6 +134,7 @@ class Engine:
         self._close_fails: dict[str, int] = {}  # pair id -> failed closes in a row
         self._close_idle: dict[str, int] = {}  # pair id -> tries in a row that traded nothing
         self._close_wanted: set[str] = set()  # pairs some path tried to close this step
+        self._close_wanted_ms: dict[str, int] = {}  # pair id -> last time a close was wanted
         self._untracked_seen: set[str] = set()
         self.state_path = Path(config.state_dir) / "engine.json"
 
@@ -564,7 +565,10 @@ class Engine:
             s = scored.get(pos.candidate.key) or self._score(pos.candidate)
             reason = should_exit(s, self.strategy, (now - pos.opened_ms) / MS_PER_HOUR)
             if reason is None:
-                if pos.id not in self._close_wanted:  # no close wanted now: start afresh
+                # no close wanted for longer than the longest wait: start afresh (a risk
+                # alert can skip a step, e.g. a failed read; that must not reset it)
+                quiet = now - self._close_wanted_ms.get(pos.id, 0) > _CLOSE_RETRY_MS * 17
+                if pos.id not in self._close_wanted and quiet:
                     self._close_fails.pop(pos.id, None)
                     self._close_idle.pop(pos.id, None)
                 continue
@@ -578,6 +582,7 @@ class Engine:
     ) -> None:
         c = pos.candidate
         self._close_wanted.add(pos.id)
+        self._close_wanted_ms[pos.id] = now
         if self._close_blocked_until.get(pos.id, 0) > now:
             return
         down = [v for v in c.venues if self._stale(v, now)]
@@ -717,8 +722,6 @@ class Engine:
         self._touched.add(pos.id)
         legs = ((c.long, 1), (c.short, -1))
         try:  # read both legs before trading either, and now, not at the start of the step
-            for inst, _ in legs:  # both books must answer (a halted leg raises here)
-                self.venues[inst.venue].fetch_touch(inst)
             helds = []
             for inst, sign in legs:
                 if inst.is_perp:
@@ -726,6 +729,9 @@ class Engine:
                     helds.append(sign * (p.qty if p else 0.0))
                 else:
                     helds.append(min(sign * self._leg_view(inst).qty, pos.qty))
+            for (inst, _), held in zip(legs, helds, strict=True):
+                if held > 0:  # every leg we will trade needs a book (a halted one raises)
+                    self.venues[inst.venue].fetch_touch(inst)
         except Exception as exc:
             log.error("flatten %s: holdings unavailable (%s); trying next step", pos.id, exc)
             return
