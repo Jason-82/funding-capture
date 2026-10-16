@@ -637,3 +637,86 @@ def test_dust_difference_below_one_order_resizes_the_record(tmp_path, clock, mon
     w.touch_quotes()
     w.engine.step()
     assert any(n.startswith("resized to holdings") for n in pos.notes)
+
+
+def test_close_that_keeps_trading_nothing_eventually_alerts(tmp_path, clock, monkeypatch, caplog):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    calls = []
+
+    def stuck(cand, qty, urgent=False):
+        calls.append(1)
+        rep = _report(w.engine.executor)
+        rep.messages.append("stopped: 1 left below lot/min size")
+        return rep
+
+    monkeypatch.setattr(w.engine.executor, "close", stuck)
+    (tmp_path / "FLATTEN").touch()
+    for _ in range(15):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    assert len(calls) == 10  # ten tries a minute apart, then it waits and says so
+    assert f"{pos.id} did not close" in caplog.text
+    assert sum("close not trading" in n for n in pos.notes) == 1
+    assert not any(n.startswith("partial close") for n in pos.notes)
+
+
+def test_tries_that_spend_nothing_do_not_reset_the_failure_count(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    pos = _open_one(w)
+    n = [0]
+
+    def alternate(cand, qty, urgent=False):
+        n[0] += 1
+        return _report(w.engine.executor, fees=1.0 if n[0] % 2 else 0.0)
+
+    monkeypatch.setattr(w.engine.executor, "close", alternate)
+    (tmp_path / "FLATTEN").touch()
+    for _ in range(200):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    assert w.engine.entries_halted == f"close of {pos.id} keeps failing (3 tries)"
+
+
+def test_open_that_paid_fees_for_nothing_cools_the_pair_down(tmp_path, clock, monkeypatch):
+    w = World(tmp_path, clock)
+    tried = []
+
+    def churn(cand, notional):
+        tried.append(cand.key)
+        return _report(w.engine.executor, fees=2.0)
+
+    monkeypatch.setattr(w.engine.executor, "open", churn)
+    w.engine.step()
+    first = tried[0]
+    for _ in range(3):
+        clock.advance(minutes=1)
+        w.touch_quotes()
+        w.engine.step()
+    assert tried.count(first) == 1
+
+
+def test_held_spot_not_in_whole_contracts_is_closed_leg_by_leg(tmp_path, clock, monkeypatch):
+    from funding_capture.venues.paper import floor_to_step
+
+    w = _spot_perp_world(tmp_path, clock)
+    pos = _open_one(w)
+    c = pos.candidate
+    spot_venue = {"a": w.va, "b": w.vb}[c.long.venue]
+    perp_venue = {"a": w.va, "b": w.vb}[c.short.venue]
+    w.engine.executor.trade_one(c.long, "sell", pos.qty * 0.005, False)  # 0.5% short of spot
+    lot = pos.qty  # the whole short is one contract
+    real = perp_venue.round_qty
+    monkeypatch.setattr(
+        perp_venue,
+        "round_qty",
+        lambda inst, q: floor_to_step(q + 1e-9, lot) if inst.is_perp else real(inst, q),
+    )
+    (tmp_path / "FLATTEN").touch()
+    clock.advance(minutes=1)
+    w.touch_quotes()
+    assert w.engine.step().closed == [pos.id]
+    assert spot_venue.fetch_spot_balance(c.long) == pytest.approx(0, abs=1e-9)
+    assert perp_venue.fetch_perp_positions() == {}

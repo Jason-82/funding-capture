@@ -312,3 +312,24 @@ def test_failed_perp_load_leaves_nothing_cached():
         v.load_instruments()
     symbols = {i.symbol for i in v.load_instruments()}  # the retry loads everything
     assert {"BTC/USD", "BIP-20DEC30-CDE"} <= symbols
+
+
+def test_halted_perp_is_not_traded_but_its_position_is_still_read():
+    api = FakeCoinbaseAPI()
+    api.products[0]["cancel_only"] = True  # BIP: Coinbase set it to cancel-only
+    v = CoinbaseVenue("coinbase", exchange=api, kinds=("perp",))
+    assert "BIP-20DEC30-CDE" not in {i.symbol for i in v.load_instruments()}
+    api.positions = [
+        {
+            "product_id": "BIP-20DEC30-CDE",
+            "side": "SHORT",
+            "number_of_contracts": "2",
+            "avg_entry_price": "70000",
+            "current_price": "71525",
+        }
+    ]
+    (pos,) = v.fetch_perp_positions().values()
+    assert pos.instrument.symbol == "BIP-20DEC30-CDE" and pos.qty == pytest.approx(-0.02)
+    api.positions[0]["side"] = "SOMETHING_NEW"
+    with pytest.raises(ValueError, match="unexpected side"):
+        v.fetch_perp_positions()  # unknown, never guessed as long

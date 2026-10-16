@@ -23,6 +23,7 @@ while this runs, so keep the timeout short.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -261,8 +262,10 @@ class PairExecutor:
             while remaining > 0:
                 qa = self._quotes([a])[0]
                 touch_a, size_a = qa.touch(a.order_side)
-                slice_qty = min(
-                    remaining, self.p.max_slice_usd / qa.mid, size_a * self.p.touch_fraction
+                slice_qty = min(  # caps never below one sendable order: whole contracts
+                    remaining,
+                    max(self.p.max_slice_usd / qa.mid, min_qty),
+                    max(size_a * self.p.touch_fraction, min_qty),  # the IOC limit bounds price
                 )
                 slice_qty = self._round_both(a, b, slice_qty)
                 if slice_qty <= 0 or slice_qty < min_qty:
@@ -312,7 +315,8 @@ class PairExecutor:
             while remaining > 0 and not (failed or timed_out):
                 qm = self._quotes([m])[0]
                 price = qm.bid if m.order_side == "buy" else qm.ask  # join our side
-                slice_qty = self._round_both(m, h, min(remaining, self.p.max_slice_usd / qm.mid))
+                cap = max(self.p.max_slice_usd / qm.mid, min_qty)  # at least one sendable order
+                slice_qty = self._round_both(m, h, min(remaining, cap))
                 if slice_qty <= 0 or slice_qty < min_qty:
                     if remaining * qm.mid > self.p.residual_tolerance_usd:
                         rep.messages.append(f"stopped: {remaining:.6g} left below lot/min size")
@@ -356,6 +360,8 @@ class PairExecutor:
                 remaining -= seen.qty
                 if seen.qty > 0:
                     started = self.clock()
+            if not failed and carry.qty > 1e-12:
+                remaining -= self._top_up(m, h, carry, rep, remaining)
             if timed_out:
                 rep.messages.append(
                     f"maker order on {m.inst.key} timed out; {remaining:.6g} not traded"
@@ -397,6 +403,35 @@ class PairExecutor:
         carry.qty = left
         touch = self._quotes([h])[0].mid if left > 1e-12 else 0.0
         return not (left > 1e-12 and self._sendable(h, left, touch) > 0)
+
+    def _top_up(
+        self, m: _LegPlan, h: _LegPlan, carry: _Carry, rep: ExecutionReport, room: float
+    ) -> float:
+        """Maker fills left below one hedge lot (a part-filled order on a whole-contract
+        perp): take the rest of that lot on the maker leg with an IOC and hedge it all,
+        instead of selling the fills back and paying the fees twice. Returns the qty
+        bought or sold. Never trades more than ``room``, what is still to be done."""
+        lot = self.venues[h.inst.venue].min_qty(h.inst)
+        if lot <= 0:
+            return 0.0
+        target = math.ceil(carry.qty / lot - 1e-9) * lot
+        need = target - carry.qty
+        vm = self.venues[m.inst.venue]
+        q = vm.round_qty(m.inst, need + 1e-9 * max(1.0, need))  # onto the grid, not under
+        if need <= 1e-12 or q < need * (1 - 1e-9) or q > room * (1 + 1e-9):
+            return 0.0
+        touch, _ = self._quotes([m])[0].touch(m.order_side)
+        f = self._ioc(m, q, touch, self.p.entry_slippage_bps)
+        if f.qty <= 0:
+            return 0.0
+        rep.fills.append(f)
+        carry.qty += f.qty
+        want = carry.qty
+        left = self._hedge(h, want, rep)
+        rep.hedged_qty += want - left
+        carry.qty = left
+        rep.messages.append(f"topped up {f.qty:.6g} on {m.inst.key} to a whole hedge lot")
+        return f.qty
 
     def _moved_away(self, m: _LegPlan, our_price: float) -> bool:
         q = self._quotes([m])[0]

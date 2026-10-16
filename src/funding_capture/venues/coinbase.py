@@ -78,6 +78,9 @@ class CoinbaseVenue(CcxtVenue):
         self.ioc_config = ioc_config
         self._products: dict[str, dict] = {}  # product_id -> last products row
         self._products_ms = 0
+        # crypto perps Coinbase has halted / set cancel-only: never traded, but their
+        # positions must still be read (a held short must never read as "no position")
+        self._untradeable: dict[str, Instrument] = {}
 
     # ------------------------------------------------------------------ helpers
     def _perp_kind_enabled(self) -> bool:
@@ -92,12 +95,14 @@ class CoinbaseVenue(CcxtVenue):
         return self._products
 
     @staticmethod
-    def _is_perp(p: dict) -> bool:
+    def _is_crypto_perp(p: dict) -> bool:
         fpd = p.get("future_product_details") or {}
         if not fpd.get("funding_interval"):
             return False  # dated future
-        if str(fpd.get("non_crypto")).lower() == "true":
-            return False  # equity-index perps etc.
+        return str(fpd.get("non_crypto")).lower() != "true"  # not equity-index perps etc.
+
+    @staticmethod
+    def _tradeable(p: dict) -> bool:
         return not any(
             str(p.get(k)).lower() == "true"
             for k in ("is_disabled", "trading_disabled", "view_only", "cancel_only")
@@ -138,7 +143,7 @@ class CoinbaseVenue(CcxtVenue):
         except Exception:
             # all or nothing: a half-filled cache (spot without the perps) would be
             # returned as complete next time, and positions on the perps go unseen
-            self._by_symbol = {}
+            self._by_symbol, self._untradeable = {}, {}
             raise
         return list(self._by_symbol.values())
 
@@ -150,7 +155,7 @@ class CoinbaseVenue(CcxtVenue):
             self._by_symbol = {s: i for s, i in self._by_symbol.items() if not i.is_perp}
         if self._perp_kind_enabled():
             for pid, p in self._refresh_products(0).items():
-                if not self._is_perp(p):
+                if not self._is_crypto_perp(p):
                     continue
                 fpd = p.get("future_product_details") or {}
                 asset, mult = canonical_asset(self._base_unit(p), self.aliases)
@@ -159,9 +164,11 @@ class CoinbaseVenue(CcxtVenue):
                 size = _f(fpd.get("contract_size"), 0.0)
                 if not asset or size <= 0:
                     continue
-                self._by_symbol[pid] = Instrument(
-                    self.name, pid, asset, Kind.PERP, "USD", mult, size
-                )
+                inst = Instrument(self.name, pid, asset, Kind.PERP, "USD", mult, size)
+                if self._tradeable(p):
+                    self._by_symbol[pid] = inst
+                else:
+                    self._untradeable[pid] = inst
 
     def fetch_funding(self, instruments=None) -> dict[str, FundingSnapshot]:
         perps = self._perps(instruments)
@@ -200,7 +207,7 @@ class CoinbaseVenue(CcxtVenue):
         products = self._refresh_products()
         for inst in perps:
             p = products.get(inst.symbol)
-            if p is None:
+            if p is None or not self._tradeable(p):  # halted now: no quote, so no entry
                 continue
             bid, ask = _f(p.get("best_bid_price")), _f(p.get("best_ask_price"))
             if not (bid and ask):
@@ -391,11 +398,18 @@ class CoinbaseVenue(CcxtVenue):
         self.load_instruments()
         out: dict[str, PerpPositionInfo] = {}
         for row in self.ex.v3PrivateGetBrokerageCfmPositions().get("positions") or []:
-            inst = self._by_symbol.get(row.get("product_id"))
+            pid = row.get("product_id")
+            inst = self._by_symbol.get(pid) or self._untradeable.get(pid)
             n = _f(row.get("number_of_contracts"))
             if inst is None or n == 0:
                 continue
-            sign = -1.0 if str(row.get("side", "")).upper() == "SHORT" else 1.0
+            side = str(row.get("side", "")).upper()
+            if side.endswith("SHORT"):
+                sign = -1.0
+            elif side.endswith("LONG"):
+                sign = 1.0
+            else:  # never guess a direction: an unreadable position is "unknown"
+                raise ValueError(f"coinbase position {pid}: unexpected side {side!r}")
             entry, mark = _f(row.get("avg_entry_price")), _f(row.get("current_price"))
             out[inst.key] = PerpPositionInfo(
                 inst,

@@ -100,7 +100,7 @@ $ pytest -q
   not `bin`.
 * `pip install` prints a lot and ends with `Successfully installed …`. A notice that a
   new pip release is available is harmless.
-* `pytest -q` should end with **`126 passed`** (the number may be higher after updates)
+* `pytest -q` should end with **`133 passed`** (the number may be higher after updates)
   and no `failed`.
 
 **Make a shortcut.** Every new Git Bash window has to switch to the project and activate
@@ -607,10 +607,12 @@ starting it again:
 3. **Kraken (and Coinbase spot):** a coin the bot doesn't list, and that you didn't own
    before, is a leftover: sell it.
 4. If `status --live` lists a pair whose coins or short are partly or fully gone, leave
-   it: on restart the bot compares what is held with its record. If a leg is mostly gone
-   it closes what is left (log line `FLATTENED`); if the legs differ a little it trims
-   the larger one (note `rebalanced`); if both are smaller by the same amount it shrinks
-   its record (note `resized to holdings`). If you also hold that coin yourself on that
+   it: on restart the bot compares what is held with its record. If the legs differ a
+   little it trims the larger one (note `rebalanced`); if both are smaller by the same
+   small amount (up to a tenth) it shrinks its record (note `resized to holdings`); if
+   more than a tenth of a leg is gone it closes the rest of the pair (log lines `legs
+   badly mismatched … possible liquidation/ADL` and `FLATTENED`: expected after a stop in
+   the middle of a close). If you also hold that coin yourself on that
    exchange, paste the details to Claude first.
 5. If you closed both legs of a pair by hand, remove it from the bot's record before
    starting it again: `fcap -c config.yaml forget --live <pair id>`. Otherwise the bot

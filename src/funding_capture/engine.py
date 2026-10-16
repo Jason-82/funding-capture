@@ -46,6 +46,7 @@ from .venues.base import Venue
 _SOFT_HALTS = ("STOP file present", "FLATTEN file present", "stale market data")
 _CLOSE_RETRY_MS = 10 * 60_000  # first wait after a close that paid fees and closed nothing
 _CLOSE_HALT_AFTER = 3  # such failures in a row: halt entries and say so
+_CLOSE_IDLE_LIMIT = 10  # tries in a row that traded nothing: treat as a failure
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ class Engine:
         self._touched: set[str] = set()  # pairs traded this step: cached positions are stale
         self._close_blocked_until: dict[str, int] = {}  # pair id -> ms, after a failed close
         self._close_fails: dict[str, int] = {}  # pair id -> failed closes in a row
+        self._close_idle: dict[str, int] = {}  # pair id -> tries in a row that traded nothing
         self._untracked_seen: set[str] = set()
         self.state_path = Path(config.state_dir) / "engine.json"
 
@@ -447,8 +449,8 @@ class Engine:
             i.key for p in self.positions.values() for i in (p.candidate.long, p.candidate.short)
         }
         for key, p in self._perp_positions.items():
-            inst = self.instruments.get(key)
-            if inst is None or inst.venue not in self._positions_fresh or key in tracked:
+            inst = self.instruments.get(key) or p.instrument  # also perps no pair trades
+            if inst.venue not in self._positions_fresh or key in tracked:
                 continue
             if abs(p.qty) < self.venues[inst.venue].min_qty(inst):
                 continue  # dust below one order
@@ -554,7 +556,8 @@ class Engine:
                 continue
             if self._imminent_funding(pos.candidate, now) > 0:
                 continue  # collect the settlement that is about to pay us, then leave
-            self._close(pos, reason, rep, now)
+            # an exit that already failed on resting orders goes straight to IOC
+            self._close(pos, reason, rep, now, urgent=pos.id in self._close_fails)
 
     def _close(
         self, pos: PairPosition, reason: str, rep: StepReport, now: int, urgent: bool = False
@@ -568,8 +571,13 @@ class Engine:
             return
         self._touched.add(pos.id)
         qty, held = self._closable_qty(pos)
-        if len(held) == 2 and abs(held[0] - held[1]) > self.limits.max_delta_drift * pos.qty:
-            # legs differ (partly liquidated, or closed by hand): close each for what it holds
+        perps = [i for i in (c.long, c.short) if i.is_perp]
+        whole = all(self.venues[i.venue].round_qty(i, qty) >= qty * 0.999 for i in perps)
+        if len(held) == 2 and (
+            abs(held[0] - held[1]) > self.limits.max_delta_drift * pos.qty or not whole
+        ):
+            # legs differ (partly liquidated, closed by hand), or what is held isn't whole
+            # contracts (a pair close would round it to nothing): close each leg as held
             self._flatten(pos, reason, rep, now)
             return
         try:
@@ -581,7 +589,7 @@ class Engine:
             self.entries_halted = f"close of {pos.id} raised: {exc}"
             log.critical("close %s raised; exposure unknown, entries halted: %s", pos.id, exc)
             pos.notes.append(f"close failed: {exc}")
-            self._close_failed(pos, now)
+            self._close_failed(pos, now, urgent, paid=False)
             return
         sold = ex.qty(c.long, "sell")
         bought = ex.qty(c.short, "buy")
@@ -610,21 +618,37 @@ class Engine:
             rep.closed.append(pos.id)
             self._forget_reading(pos)
             self._close_fails.pop(pos.id, None)
+            self._close_idle.pop(pos.id, None)
             log.info("CLOSED %s (%s) net $%.2f", pos.id, reason, pos.net_pnl_usd)
         else:
             pos.qty -= done
-            pos.notes.append(f"partial close {done:.6g}: {reason}")
+            if done > 0:
+                pos.notes.append(f"partial close {done:.6g}: {reason}")
+                self._close_fails.pop(pos.id, None)  # progress resets both counters
+                self._close_idle.pop(pos.id, None)
             if ex.unsafe or ex.has_residual or (done <= 0 and ex.fees_usd > 0):
-                self._close_failed(pos, now)  # paid fees for nothing, or exposure unclear
-            else:  # progress, or nothing spent (orders didn't fill): try again next step
-                self._close_fails.pop(pos.id, None)
+                self._close_failed(pos, now, urgent, paid=ex.fees_usd > 0)
+            elif done <= 0:  # nothing traded and nothing spent (orders didn't fill)
+                idle = self._close_idle[pos.id] = self._close_idle.get(pos.id, 0) + 1
+                if idle >= _CLOSE_IDLE_LIMIT:
+                    self._close_idle.pop(pos.id, None)
+                    pos.notes.append(f"close not trading: {'; '.join(ex.messages)}")
+                    self._close_failed(pos, now, urgent, paid=False)
+                else:
+                    log.warning(
+                        "%s: close traded nothing (%s); trying again next step",
+                        pos.id,
+                        "; ".join(ex.messages),
+                    )
+            else:
                 log.warning("%s: closed %.6g of %.6g; trying the rest next step", pos.id, done, qty)
 
-    def _close_failed(self, pos: PairPosition, now: int) -> None:
-        """Wait before the next try (10, 20, 40, 80, then 160 min), since each failed try
-        may pay the spot fees twice; after a few, halt entries so a person looks."""
+    def _close_failed(self, pos: PairPosition, now: int, urgent: bool, paid: bool) -> None:
+        """Wait before the next try: 10, 20, 40, 80, then 160 min when tries pay fees (a
+        failed try can pay the spot fees twice); a flat 10 min for an urgent close that
+        spent nothing. After a few failures, halt entries so a person looks."""
         n = self._close_fails[pos.id] = self._close_fails.get(pos.id, 0) + 1
-        wait = _CLOSE_RETRY_MS * 2 ** min(n - 1, 4)
+        wait = _CLOSE_RETRY_MS if urgent and not paid else _CLOSE_RETRY_MS * 2 ** min(n - 1, 4)
         self._close_blocked_until[pos.id] = now + wait
         log.critical(
             "%s did not close (try %d, exit fees so far $%.2f); next try in %d min. If this "
@@ -711,6 +735,7 @@ class Engine:
             rep.closed.append(pos.id)
             self._forget_reading(pos)
             self._close_fails.pop(pos.id, None)
+            self._close_idle.pop(pos.id, None)
             log.warning("FLATTENED %s (%s)", pos.id, reason)
         else:
             self.entries_halted = f"could not flatten {pos.id}"
@@ -859,6 +884,10 @@ class Engine:
         )
         if qty <= 0 or long_px is None or short_px is None:
             log.info("open %s: nothing hedged (%s)", c.key, "; ".join(ex.messages))
+            if ex.fees_usd > 0:  # paid to buy and sell back: don't repeat it every step
+                until = now + int(self.cfg.risk_cooldown_minutes * 60_000)
+                for inst in (c.long, c.short):
+                    self._cooldown_until[inst.key] = until
             return None
         self._seq += 1
         pos = PairPosition(
